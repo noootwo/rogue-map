@@ -1,5 +1,7 @@
 # RogueMap (Node.js)
 
+[中文文档](./README_zh-CN.md)
+
 A high-performance, memory-efficient key-value store for Node.js, inspired by [RogueMap (Java)](https://roguemap.yomahub.com/).
 
 ## Features
