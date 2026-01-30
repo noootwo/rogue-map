@@ -1,6 +1,6 @@
 {
   "name": "rogue-map",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "type": "module",
   "description": "A high-performance, off-heap hash map for Node.js with 99% less memory usage than native Map.",
   "main": "./dist/index.cjs",
