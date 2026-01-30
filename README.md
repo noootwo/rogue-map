@@ -114,9 +114,9 @@ await map.init();
 
 | Type         | Write Time | Read Time | Heap Used   | Total RSS |
 | ------------ | ---------- | --------- | ----------- | --------- |
-| **Object**   | 505ms      | 282ms     | 77.75 MB    | 113.84 MB |
-| **Map**      | **299ms**  | **19ms**  | 57.75 MB    | 53.13 MB  |
-| **RogueMap** | 454ms      | 397ms     | **0.06 MB** | 64.84 MB  |
+| **Object**   | 533ms      | 278ms     | 77.75 MB    | 113.56 MB |
+| **Map**      | **300ms**  | **19ms**  | 57.75 MB    | 53.20 MB  |
+| **RogueMap** | 472ms      | 365ms     | **0.04 MB** | 64.75 MB  |
 
 ### 10M Items
 

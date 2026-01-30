@@ -13,6 +13,7 @@ export class PagedBuffer {
 
   private pages: Buffer[];
   private _length: number;
+  private singlePage: Buffer | null; // Optimization for single-page scenarios
 
   constructor(initialSize: number) {
     this._length = initialSize;
@@ -25,6 +26,8 @@ export class PagedBuffer {
       this.pages[i] = Buffer.allocUnsafe(size);
       remaining -= size;
     }
+
+    this.singlePage = numPages === 1 ? this.pages[0] : null;
   }
 
   get length(): number {
@@ -51,9 +54,6 @@ export class PagedBuffer {
         if (oldPages[i].length >= size) {
           this.pages[i] = oldPages[i].subarray(0, size);
         } else {
-          // This case shouldn't happen if we only grow, unless we shrink then grow
-          // But for simplicity, if we need larger, we allocate new and copy
-          // Actually, pages are fixed size except the last one.
           const newPage = Buffer.allocUnsafe(size);
           oldPages[i].copy(newPage);
           this.pages[i] = newPage;
@@ -64,21 +64,32 @@ export class PagedBuffer {
       }
       remaining -= size;
     }
+
+    this.singlePage = numPages === 1 ? this.pages[0] : null;
   }
 
   readUInt8(offset: number): number {
+    if (this.singlePage) return this.singlePage.readUInt8(offset);
+
     const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
     const pageOffset = offset % PagedBuffer.PAGE_SIZE;
     return this.pages[pageIdx].readUInt8(pageOffset);
   }
 
   writeUInt8(value: number, offset: number): void {
+    if (this.singlePage) {
+      this.singlePage.writeUInt8(value, offset);
+      return;
+    }
+
     const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
     const pageOffset = offset % PagedBuffer.PAGE_SIZE;
     this.pages[pageIdx].writeUInt8(value, pageOffset);
   }
 
   readInt32LE(offset: number): number {
+    if (this.singlePage) return this.singlePage.readInt32LE(offset);
+
     const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
     const pageOffset = offset % PagedBuffer.PAGE_SIZE;
 
@@ -92,6 +103,11 @@ export class PagedBuffer {
   }
 
   writeInt32LE(value: number, offset: number): void {
+    if (this.singlePage) {
+      this.singlePage.writeInt32LE(value, offset);
+      return;
+    }
+
     const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
     const pageOffset = offset % PagedBuffer.PAGE_SIZE;
 
@@ -106,6 +122,8 @@ export class PagedBuffer {
   }
 
   readUInt32LE(offset: number): number {
+    if (this.singlePage) return this.singlePage.readUInt32LE(offset);
+
     const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
     const pageOffset = offset % PagedBuffer.PAGE_SIZE;
 
@@ -117,6 +135,11 @@ export class PagedBuffer {
   }
 
   writeUInt32LE(value: number, offset: number): void {
+    if (this.singlePage) {
+      this.singlePage.writeUInt32LE(value, offset);
+      return;
+    }
+
     const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
     const pageOffset = offset % PagedBuffer.PAGE_SIZE;
 
@@ -162,6 +185,15 @@ export class PagedBuffer {
     sourceStart: number,
     sourceEnd: number,
   ): number {
+    if (this.singlePage) {
+      return this.singlePage.copy(
+        target as Buffer,
+        targetStart,
+        sourceStart,
+        sourceEnd,
+      );
+    }
+
     let currentSource = sourceStart;
     let currentTarget = targetStart;
     let remaining = sourceEnd - sourceStart;
@@ -171,12 +203,6 @@ export class PagedBuffer {
       const pageIdx = Math.floor(currentSource / PagedBuffer.PAGE_SIZE);
       const pageOffset = currentSource % PagedBuffer.PAGE_SIZE;
       const toCopy = Math.min(remaining, PagedBuffer.PAGE_SIZE - pageOffset);
-      // Limit by target size if needed (assuming target is large enough for now as per Buffer.copy spec)
-
-      // Check if target is PagedBuffer? No, signature says Buffer | Uint8Array.
-      // Wait, RogueMap needs to copy FROM PagedBuffer TO PagedBuffer during resize.
-      // We need a separate method for that or handle it here.
-      // For now, this is copying FROM this PagedBuffer TO a standard Buffer (e.g. for decoding keys).
 
       this.pages[pageIdx].copy(
         target as Buffer,
@@ -236,11 +262,21 @@ export class PagedBuffer {
     sourceStart: number,
     sourceEnd: number,
   ): number {
+    if (this.singlePage) {
+      return this.singlePage.compare(
+        target,
+        targetStart,
+        targetEnd,
+        sourceStart,
+        sourceEnd,
+      );
+    }
+
     // Compare THIS (source) with TARGET (standard Buffer)
     // Used for key comparison
     const len = sourceEnd - sourceStart;
     const targetLen = targetEnd - targetStart;
-    if (len !== targetLen) return len - targetLen; // Simple length check shortcut? Buffer.compare semantics are different but for equality 0 matters.
+    if (len !== targetLen) return len - targetLen;
 
     let currentSource = sourceStart;
     let currentTarget = targetStart;
@@ -271,12 +307,26 @@ export class PagedBuffer {
 
   // For direct writing of buffers (keys/values)
   writeBuffer(buf: Buffer, offset: number): void {
+    if (this.singlePage) {
+      // Optimization: Single page
+      // Use copy logic from Buffer
+      // buf.copy(this.singlePage, offset)
+      // Wait, writeBuffer signature: writeBuffer(buf, offset) means "write buf INTO this at offset"
+      // Buffer.copy(target, targetStart, sourceStart, sourceEnd)
+      // So: buf.copy(this.singlePage, offset)
+      buf.copy(this.singlePage, offset);
+      return;
+    }
     this.writeMultiByte(buf, offset);
   }
 
   // For reading buffers (decoding)
   readBuffer(offset: number, length: number): Buffer {
-    // Optimization: Single page
+    if (this.singlePage) {
+      return this.singlePage.subarray(offset, offset + length);
+    }
+
+    // Optimization: Single page within multi-page
     const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
     const pageOffset = offset % PagedBuffer.PAGE_SIZE;
     if (pageOffset + length <= PagedBuffer.PAGE_SIZE) {

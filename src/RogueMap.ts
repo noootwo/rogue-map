@@ -355,13 +355,28 @@ export class RogueMap<K = any, V = any> {
   }
 
   private put(key: K, value: V, hash: number): void {
-    let index = Math.abs(hash % this.capacity);
+    const buckets = this.buckets;
+    const states = this.states;
+    const hashes = this.hashes;
+    const capacity = this.capacity;
+
+    let index = Math.abs(hash % capacity);
     let start_index = index;
     let tombstoneIndex = -1;
 
+    // PRE-ENCODE KEY: Avoid re-encoding in the loop
+    const keyLen = this.keyCodec.byteLength(key);
+    // Ensure temp buffer is large enough
+    if (this.tempKeyBuffer.length < keyLen) {
+      this.tempKeyBuffer = Buffer.allocUnsafe(
+        Math.max(keyLen, this.tempKeyBuffer.length * 2),
+      );
+    }
+    this.keyCodec.encode(key, this.tempKeyBuffer, 0);
+
     // Linear probing to find existing key or empty slot
     while (true) {
-      const offset = this.buckets[index];
+      const offset = buckets[index];
 
       if (offset === 0) {
         // Found empty slot
@@ -375,19 +390,19 @@ export class RogueMap<K = any, V = any> {
 
       // Check if deleted or match
       // FAST PATH: Use states array
-      const state = this.states[index];
+      const state = states[index];
 
       if (state === FLAG_DELETED) {
         if (tombstoneIndex === -1) tombstoneIndex = index;
       } else if (state === FLAG_ACTIVE) {
         // Active entry, check key
         // FAST PATH: Check hash from Int32Array
-        if (this.hashes[index] === hash) {
+        if (hashes[index] === hash) {
           // Only now we read buffer
-          if (this.keyMatches(offset, key)) {
+          if (this.keyMatchesPreEncoded(offset, keyLen)) {
             // Mark old as deleted
             this.buffer.writeUInt8(FLAG_DELETED, offset);
-            this.states[index] = FLAG_DELETED; // Update state
+            states[index] = FLAG_DELETED; // Update state
             this._deletedCount++;
 
             // Append new entry and update bucket
@@ -397,7 +412,7 @@ export class RogueMap<K = any, V = any> {
         }
       }
 
-      index = (index + 1) % this.capacity;
+      index = (index + 1) % capacity;
       if (index === start_index) {
         throw new Error("RogueMap: Hash table full");
       }
@@ -646,18 +661,32 @@ export class RogueMap<K = any, V = any> {
     }
 
     const hash = this.hasher(key) | 0;
-    let index = Math.abs(hash % this.capacity);
+    const capacity = this.capacity;
+    const buckets = this.buckets;
+    const states = this.states;
+    const hashes = this.hashes;
+
+    let index = Math.abs(hash % capacity);
     let start_index = index;
 
+    // PRE-ENCODE KEY for keyMatchesPreEncoded
+    const keyLen = this.keyCodec.byteLength(key);
+    if (this.tempKeyBuffer.length < keyLen) {
+      this.tempKeyBuffer = Buffer.allocUnsafe(
+        Math.max(keyLen, this.tempKeyBuffer.length * 2),
+      );
+    }
+    this.keyCodec.encode(key, this.tempKeyBuffer, 0);
+
     while (true) {
-      const offset = this.buckets[index];
+      const offset = buckets[index];
       if (offset === 0) return undefined;
 
       // FAST PATH
-      if (this.states[index] === FLAG_ACTIVE) {
-        if (this.hashes[index] === hash) {
+      if (states[index] === FLAG_ACTIVE) {
+        if (hashes[index] === hash) {
           // Only now we read buffer
-          if (this.keyMatches(offset, key)) {
+          if (this.keyMatchesPreEncoded(offset, keyLen)) {
             const val = this.readValue(offset);
             // Update Cache
             if (this.cache) {
@@ -673,7 +702,7 @@ export class RogueMap<K = any, V = any> {
         }
       }
 
-      index = (index + 1) % this.capacity;
+      index = (index + 1) % capacity;
       if (index === start_index) return undefined;
     }
   }
@@ -685,21 +714,35 @@ export class RogueMap<K = any, V = any> {
    */
   has(key: K): boolean {
     const hash = this.hasher(key) | 0;
-    let index = Math.abs(hash % this.capacity);
+    const capacity = this.capacity;
+    const buckets = this.buckets;
+    const states = this.states;
+    const hashes = this.hashes;
+
+    let index = Math.abs(hash % capacity);
     let start_index = index;
 
+    // PRE-ENCODE KEY
+    const keyLen = this.keyCodec.byteLength(key);
+    if (this.tempKeyBuffer.length < keyLen) {
+      this.tempKeyBuffer = Buffer.allocUnsafe(
+        Math.max(keyLen, this.tempKeyBuffer.length * 2),
+      );
+    }
+    this.keyCodec.encode(key, this.tempKeyBuffer, 0);
+
     while (true) {
-      const offset = this.buckets[index];
+      const offset = buckets[index];
       if (offset === 0) return false;
 
       // FAST PATH
-      if (this.states[index] === FLAG_ACTIVE) {
-        if (this.hashes[index] === hash) {
-          if (this.keyMatches(offset, key)) return true;
+      if (states[index] === FLAG_ACTIVE) {
+        if (hashes[index] === hash) {
+          if (this.keyMatchesPreEncoded(offset, keyLen)) return true;
         }
       }
 
-      index = (index + 1) % this.capacity;
+      index = (index + 1) % capacity;
       if (index === start_index) return false;
     }
   }
@@ -716,19 +759,33 @@ export class RogueMap<K = any, V = any> {
     }
 
     const hash = this.hasher(key) | 0;
-    let index = Math.abs(hash % this.capacity);
+    const capacity = this.capacity;
+    const buckets = this.buckets;
+    const states = this.states;
+    const hashes = this.hashes;
+
+    let index = Math.abs(hash % capacity);
     let start_index = index;
 
+    // PRE-ENCODE KEY
+    const keyLen = this.keyCodec.byteLength(key);
+    if (this.tempKeyBuffer.length < keyLen) {
+      this.tempKeyBuffer = Buffer.allocUnsafe(
+        Math.max(keyLen, this.tempKeyBuffer.length * 2),
+      );
+    }
+    this.keyCodec.encode(key, this.tempKeyBuffer, 0);
+
     while (true) {
-      const offset = this.buckets[index];
+      const offset = buckets[index];
       if (offset === 0) return false;
 
       // FAST PATH
-      if (this.states[index] === FLAG_ACTIVE) {
-        if (this.hashes[index] === hash) {
-          if (this.keyMatches(offset, key)) {
+      if (states[index] === FLAG_ACTIVE) {
+        if (hashes[index] === hash) {
+          if (this.keyMatchesPreEncoded(offset, keyLen)) {
             this.buffer.writeUInt8(FLAG_DELETED, offset);
-            this.states[index] = FLAG_DELETED; // Update state
+            states[index] = FLAG_DELETED; // Update state
             this._size--;
             this._deletedCount++;
             this.checkCompaction();
@@ -737,7 +794,7 @@ export class RogueMap<K = any, V = any> {
         }
       }
 
-      index = (index + 1) % this.capacity;
+      index = (index + 1) % capacity;
       if (index === start_index) return false;
     }
   }
@@ -823,7 +880,7 @@ export class RogueMap<K = any, V = any> {
     this.states[index] = FLAG_ACTIVE;
   }
 
-  private keyMatches(offset: number, key: K): boolean {
+  private keyMatchesPreEncoded(offset: number, keyLen: number): boolean {
     let cursor = offset + 5; // Skip Flag(1) + Hash(4)
 
     let keySize: number;
@@ -840,11 +897,40 @@ export class RogueMap<K = any, V = any> {
     }
 
     // Optimization: Compare byte length first
+    if (keyLen !== keySize) return false;
+
+    // Zero-Allocation Compare: Use pre-encoded key
+    return (
+      this.buffer.compare(
+        this.tempKeyBuffer,
+        0,
+        keyLen,
+        cursor,
+        cursor + keySize,
+      ) === 0
+    );
+  }
+
+  private keyMatches(offset: number, key: K): boolean {
+    // Deprecated in favor of keyMatchesPreEncoded, keeping just in case or for testing
+    // Logic is same as before
+    let cursor = offset + 5; // Skip Flag(1) + Hash(4)
+
+    let keySize: number;
+    if (this.keyCodec.fixedLength !== undefined) {
+      keySize = this.keyCodec.fixedLength;
+    } else {
+      keySize = this.buffer.readInt32LE(cursor);
+      cursor += 4;
+    }
+
+    if (this.valueCodec.fixedLength === undefined) {
+      cursor += 4;
+    }
+
     const len = this.keyCodec.byteLength(key);
     if (len !== keySize) return false;
 
-    // Zero-Allocation Compare: Encode input key and compare bytes directly
-    // This supports AnyCodec and Value-based keys (e.g. {a:1} == {a:1})
     if (len <= this.tempKeyBuffer.length) {
       this.keyCodec.encode(key, this.tempKeyBuffer, 0);
       return (
@@ -858,7 +944,6 @@ export class RogueMap<K = any, V = any> {
       );
     }
 
-    // Fallback for large keys
     const temp = Buffer.allocUnsafe(len);
     this.keyCodec.encode(key, temp, 0);
     return this.buffer.compare(temp, 0, len, cursor, cursor + keySize) === 0;
