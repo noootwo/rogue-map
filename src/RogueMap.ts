@@ -69,7 +69,9 @@ const FLAG_DELETED = 2;
  */
 export class RogueMap<K = any, V = any> {
   private capacity: number;
+  private capacityMask: number; // Optimization: mask for modulo operations (capacity - 1)
   private buffer: PagedBuffer;
+  private rawBuffer: Buffer | null = null; // Optimization: Direct access for single-page buffers
   private buckets: Float64Array; // Changed to Float64Array to support >2GB offsets
   private hashes: Int32Array;
   private states: Uint8Array;
@@ -97,13 +99,21 @@ export class RogueMap<K = any, V = any> {
    * @param options Configuration options
    */
   constructor(options: RogueMapOptions<K, V> = {}) {
-    this.capacity = options.capacity || DEFAULT_CAPACITY;
+    // Ensure capacity is power of 2 for fast modulo
+    let cap = options.capacity || DEFAULT_CAPACITY;
+    if ((cap & (cap - 1)) !== 0) {
+      cap = Math.pow(2, Math.ceil(Math.log2(cap)));
+    }
+    this.capacity = cap;
+    this.capacityMask = cap - 1;
+
     this.buckets = new Float64Array(this.capacity);
     this.hashes = new Int32Array(this.capacity);
     this.states = new Uint8Array(this.capacity); // 0=Empty, 1=Active, 2=Deleted
     this.buffer = PagedBuffer.allocUnsafe(
       options.initialMemory || DEFAULT_MEMORY,
     );
+    this.rawBuffer = this.buffer.getSinglePage();
     this.writeOffset = 1; // Start at 1 because 0 in buckets means empty
 
     // Default to AnyCodec for maximum flexibility if no codec is provided
@@ -252,6 +262,7 @@ export class RogueMap<K = any, V = any> {
 
     // Update instance state
     this.capacity = capacity;
+    this.capacityMask = capacity - 1;
     this.buckets = savedBuckets;
     this.hashes = new Int32Array(capacity);
     this.states = new Uint8Array(capacity);
@@ -259,6 +270,7 @@ export class RogueMap<K = any, V = any> {
     this.writeOffset = writeOffset;
     this.buffer = PagedBuffer.allocUnsafe(bufferLength);
     this.buffer.writeBuffer(data.subarray(cursor, cursor + bufferLength), 0);
+    this.rawBuffer = this.buffer.getSinglePage();
 
     this._deletedCount = 0;
 
@@ -358,11 +370,7 @@ export class RogueMap<K = any, V = any> {
     const buckets = this.buckets;
     const states = this.states;
     const hashes = this.hashes;
-    const capacity = this.capacity;
-
-    let index = Math.abs(hash % capacity);
-    let start_index = index;
-    let tombstoneIndex = -1;
+    const mask = this.capacityMask;
 
     // PRE-ENCODE KEY: Avoid re-encoding in the loop
     const keyLen = this.keyCodec.byteLength(key);
@@ -374,7 +382,187 @@ export class RogueMap<K = any, V = any> {
     }
     this.keyCodec.encode(key, this.tempKeyBuffer, 0);
 
-    // Linear probing to find existing key or empty slot
+    let index = Math.abs(hash) & mask;
+    const start_index = index;
+    let tombstoneIndex = -1;
+
+    // === OPTIMIZED PATH: Single Page Buffer (Direct Access) ===
+    if (this.rawBuffer) {
+      const raw = this.rawBuffer;
+      const tempKey = this.tempKeyBuffer;
+      const keyFixed = this.keyCodec.fixedLength;
+      const valFixed = this.valueCodec.fixedLength;
+
+      while (true) {
+        const offset = buckets[index];
+
+        if (offset === 0) {
+          // Found empty slot
+          if (tombstoneIndex !== -1) {
+            index = tombstoneIndex;
+          }
+          // INLINE WRITE ENTRY
+          const valLen = this.valueCodec.byteLength(value);
+          let entrySize = 5; // Flag(1) + Hash(4)
+          if (keyFixed === undefined) entrySize += 4;
+          if (valFixed === undefined) entrySize += 4;
+          entrySize += keyLen + valLen;
+
+          if (this.writeOffset + entrySize > raw.length) {
+            throw new Error("RogueMap: Out of memory (Buffer full)");
+          }
+
+          let cursor = this.writeOffset;
+          raw[cursor++] = FLAG_ACTIVE;
+
+          // Manual Write Hash (Int32LE)
+          raw[cursor] = hash & 0xff;
+          raw[cursor + 1] = (hash >>> 8) & 0xff;
+          raw[cursor + 2] = (hash >>> 16) & 0xff;
+          raw[cursor + 3] = (hash >>> 24) & 0xff;
+          cursor += 4;
+
+          if (keyFixed === undefined) {
+            // Manual Write KeyLen (Int32LE)
+            raw[cursor] = keyLen & 0xff;
+            raw[cursor + 1] = (keyLen >>> 8) & 0xff;
+            raw[cursor + 2] = (keyLen >>> 16) & 0xff;
+            raw[cursor + 3] = (keyLen >>> 24) & 0xff;
+            cursor += 4;
+          }
+          if (valFixed === undefined) {
+            // Manual Write ValLen (Int32LE)
+            raw[cursor] = valLen & 0xff;
+            raw[cursor + 1] = (valLen >>> 8) & 0xff;
+            raw[cursor + 2] = (valLen >>> 16) & 0xff;
+            raw[cursor + 3] = (valLen >>> 24) & 0xff;
+            cursor += 4;
+          }
+
+          // Write Key (Copy from temp buffer - FAST)
+          if (keyLen > 0) {
+            tempKey.copy(raw, cursor, 0, keyLen);
+            cursor += keyLen;
+          }
+
+          // Write Val (Encode directly to buffer - FAST)
+          if (valLen > 0) {
+            this.valueCodec.encode(value, raw, cursor);
+            cursor += valLen;
+          }
+
+          this.buckets[index] = this.writeOffset;
+          this.hashes[index] = hash;
+          this.states[index] = FLAG_ACTIVE;
+          this.writeOffset += entrySize;
+          this._size++;
+          return;
+        }
+
+        const state = states[index];
+
+        if (state === FLAG_DELETED) {
+          if (tombstoneIndex === -1) tombstoneIndex = index;
+        } else if (state === FLAG_ACTIVE) {
+          if (hashes[index] === hash) {
+            // INLINE COMPARE
+            let cursor = offset + 5;
+            let storedKeyLen = keyLen;
+            if (keyFixed === undefined) {
+              // Manual Read KeyLen (Int32LE)
+              storedKeyLen =
+                raw[cursor] |
+                (raw[cursor + 1] << 8) |
+                (raw[cursor + 2] << 16) |
+                (raw[cursor + 3] << 24);
+              cursor += 4;
+            }
+            if (valFixed === undefined) {
+              cursor += 4; // Skip val len
+            }
+
+            if (storedKeyLen === keyLen) {
+              // Manual Compare
+              let match = true;
+              for (let k = 0; k < keyLen; k++) {
+                if (raw[cursor + k] !== tempKey[k]) {
+                  match = false;
+                  break;
+                }
+              }
+
+              if (match) {
+                // MATCH FOUND - UPDATE
+                raw[offset] = FLAG_DELETED;
+                states[index] = FLAG_DELETED;
+                this._deletedCount++;
+
+                // Append new
+                // COPY PASTE WRITE LOGIC (To avoid function call)
+                const valLen = this.valueCodec.byteLength(value);
+                let entrySize = 5;
+                if (keyFixed === undefined) entrySize += 4;
+                if (valFixed === undefined) entrySize += 4;
+                entrySize += keyLen + valLen;
+
+                if (this.writeOffset + entrySize > raw.length) {
+                  throw new Error("RogueMap: Out of memory (Buffer full)");
+                }
+
+                let wCursor = this.writeOffset;
+                raw[wCursor++] = FLAG_ACTIVE;
+
+                // Manual Write Hash
+                raw[wCursor] = hash & 0xff;
+                raw[wCursor + 1] = (hash >>> 8) & 0xff;
+                raw[wCursor + 2] = (hash >>> 16) & 0xff;
+                raw[wCursor + 3] = (hash >>> 24) & 0xff;
+                wCursor += 4;
+
+                if (keyFixed === undefined) {
+                  // Manual Write KeyLen
+                  raw[wCursor] = keyLen & 0xff;
+                  raw[wCursor + 1] = (keyLen >>> 8) & 0xff;
+                  raw[wCursor + 2] = (keyLen >>> 16) & 0xff;
+                  raw[wCursor + 3] = (keyLen >>> 24) & 0xff;
+                  wCursor += 4;
+                }
+                if (valFixed === undefined) {
+                  // Manual Write ValLen
+                  raw[wCursor] = valLen & 0xff;
+                  raw[wCursor + 1] = (valLen >>> 8) & 0xff;
+                  raw[wCursor + 2] = (valLen >>> 16) & 0xff;
+                  raw[wCursor + 3] = (valLen >>> 24) & 0xff;
+                  wCursor += 4;
+                }
+
+                if (keyLen > 0) {
+                  tempKey.copy(raw, wCursor, 0, keyLen);
+                  wCursor += keyLen;
+                }
+                if (valLen > 0) {
+                  this.valueCodec.encode(value, raw, wCursor);
+                  wCursor += valLen;
+                }
+
+                this.buckets[index] = this.writeOffset;
+                this.hashes[index] = hash;
+                this.states[index] = FLAG_ACTIVE;
+                this.writeOffset += entrySize;
+                return;
+              }
+            }
+          }
+        }
+
+        index = (index + 1) & mask;
+        if (index === start_index) {
+          throw new Error("RogueMap: Hash table full");
+        }
+      }
+    }
+
+    // === SLOW PATH: Multi-Page Buffer ===
     while (true) {
       const offset = buckets[index];
 
@@ -389,16 +577,13 @@ export class RogueMap<K = any, V = any> {
       }
 
       // Check if deleted or match
-      // FAST PATH: Use states array
       const state = states[index];
 
       if (state === FLAG_DELETED) {
         if (tombstoneIndex === -1) tombstoneIndex = index;
       } else if (state === FLAG_ACTIVE) {
         // Active entry, check key
-        // FAST PATH: Check hash from Int32Array
         if (hashes[index] === hash) {
-          // Only now we read buffer
           if (this.keyMatchesPreEncoded(offset, keyLen)) {
             // Mark old as deleted
             this.buffer.writeUInt8(FLAG_DELETED, offset);
@@ -412,7 +597,8 @@ export class RogueMap<K = any, V = any> {
         }
       }
 
-      index = (index + 1) % capacity;
+      // Fast Modulo
+      index = (index + 1) & mask;
       if (index === start_index) {
         throw new Error("RogueMap: Hash table full");
       }
@@ -436,11 +622,18 @@ export class RogueMap<K = any, V = any> {
     const oldBuffer = this.buffer;
     const oldLimit = this.writeOffset;
 
+    // Ensure power of 2
+    if ((newCapacity & (newCapacity - 1)) !== 0) {
+      newCapacity = Math.pow(2, Math.ceil(Math.log2(newCapacity)));
+    }
+
     this.capacity = newCapacity;
+    this.capacityMask = newCapacity - 1;
     this.buckets = new Float64Array(this.capacity);
     this.hashes = new Int32Array(this.capacity);
     this.states = new Uint8Array(this.capacity);
     this.buffer = PagedBuffer.allocUnsafe(newMemory);
+    this.rawBuffer = this.buffer.getSinglePage();
     this.writeOffset = 1;
     this._size = 0;
 
@@ -661,12 +854,12 @@ export class RogueMap<K = any, V = any> {
     }
 
     const hash = this.hasher(key) | 0;
-    const capacity = this.capacity;
     const buckets = this.buckets;
     const states = this.states;
     const hashes = this.hashes;
+    const mask = this.capacityMask;
 
-    let index = Math.abs(hash % capacity);
+    let index = Math.abs(hash) & mask;
     let start_index = index;
 
     // PRE-ENCODE KEY for keyMatchesPreEncoded
@@ -677,6 +870,89 @@ export class RogueMap<K = any, V = any> {
       );
     }
     this.keyCodec.encode(key, this.tempKeyBuffer, 0);
+
+    // === OPTIMIZED PATH ===
+    if (this.rawBuffer) {
+      const raw = this.rawBuffer;
+      const tempKey = this.tempKeyBuffer;
+      const keyFixed = this.keyCodec.fixedLength;
+      const valFixed = this.valueCodec.fixedLength;
+
+      while (true) {
+        const offset = buckets[index];
+        if (offset === 0) return undefined;
+
+        if (states[index] === FLAG_ACTIVE) {
+          if (hashes[index] === hash) {
+            // INLINE COMPARE
+            let cursor = offset + 5;
+            let storedKeyLen = keyLen;
+            if (keyFixed === undefined) {
+              // Manual Read KeyLen
+              storedKeyLen =
+                raw[cursor] |
+                (raw[cursor + 1] << 8) |
+                (raw[cursor + 2] << 16) |
+                (raw[cursor + 3] << 24);
+              cursor += 4;
+            }
+            if (valFixed === undefined) {
+              cursor += 4; // Skip val len
+            }
+
+            if (storedKeyLen === keyLen) {
+              // Manual Compare
+              let match = true;
+              for (let k = 0; k < keyLen; k++) {
+                if (raw[cursor + k] !== tempKey[k]) {
+                  match = false;
+                  break;
+                }
+              }
+
+              if (match) {
+                // MATCH! READ VALUE INLINE
+                let vCursor = offset + 5;
+                if (keyFixed === undefined) vCursor += 4;
+
+                let valLen: number;
+                if (valFixed !== undefined) {
+                  valLen = valFixed;
+                } else {
+                  // Manual Read ValLen
+                  valLen =
+                    raw[vCursor] |
+                    (raw[vCursor + 1] << 8) |
+                    (raw[vCursor + 2] << 16) |
+                    (raw[vCursor + 3] << 24);
+                  vCursor += 4;
+                }
+
+                vCursor += keyLen; // Skip Key
+
+                // Read Val
+                // Use subarray to be safe with codecs expecting buffer from 0
+                const valBuf = raw.subarray(vCursor, vCursor + valLen);
+                const val = this.valueCodec.decode(valBuf, 0, valLen);
+
+                // Update Cache
+                if (this.cache) {
+                  if (this.cache.size >= this.cacheSize) {
+                    const oldestKey = this.cache.keys().next().value;
+                    if (oldestKey !== undefined) this.cache.delete(oldestKey);
+                  }
+                  this.cache.set(key, val);
+                }
+                return val;
+              }
+            }
+          }
+        }
+
+        index = (index + 1) & mask;
+        if (index === start_index) return undefined;
+      }
+    }
 
     while (true) {
       const offset = buckets[index];
@@ -702,7 +978,7 @@ export class RogueMap<K = any, V = any> {
         }
       }
 
-      index = (index + 1) % capacity;
+      index = (index + 1) & mask;
       if (index === start_index) return undefined;
     }
   }
@@ -714,12 +990,12 @@ export class RogueMap<K = any, V = any> {
    */
   has(key: K): boolean {
     const hash = this.hasher(key) | 0;
-    const capacity = this.capacity;
     const buckets = this.buckets;
     const states = this.states;
     const hashes = this.hashes;
+    const mask = this.capacityMask;
 
-    let index = Math.abs(hash % capacity);
+    let index = Math.abs(hash) & mask;
     let start_index = index;
 
     // PRE-ENCODE KEY
@@ -730,6 +1006,55 @@ export class RogueMap<K = any, V = any> {
       );
     }
     this.keyCodec.encode(key, this.tempKeyBuffer, 0);
+
+    // === OPTIMIZED PATH ===
+    if (this.rawBuffer) {
+      const raw = this.rawBuffer;
+      const tempKey = this.tempKeyBuffer;
+      const keyFixed = this.keyCodec.fixedLength;
+      const valFixed = this.valueCodec.fixedLength;
+
+      while (true) {
+        const offset = buckets[index];
+        if (offset === 0) return false;
+
+        if (states[index] === FLAG_ACTIVE) {
+          if (hashes[index] === hash) {
+            // INLINE COMPARE
+            let cursor = offset + 5;
+            let storedKeyLen = keyLen;
+            if (keyFixed === undefined) {
+              // Manual Read KeyLen
+              storedKeyLen =
+                raw[cursor] |
+                (raw[cursor + 1] << 8) |
+                (raw[cursor + 2] << 16) |
+                (raw[cursor + 3] << 24);
+              cursor += 4;
+            }
+            if (valFixed === undefined) cursor += 4;
+
+            if (storedKeyLen === keyLen) {
+              // Manual Compare
+              let match = true;
+              for (let k = 0; k < keyLen; k++) {
+                if (raw[cursor + k] !== tempKey[k]) {
+                  match = false;
+                  break;
+                }
+              }
+
+              if (match) {
+                return true;
+              }
+            }
+          }
+        }
+
+        index = (index + 1) & mask;
+        if (index === start_index) return false;
+      }
+    }
 
     while (true) {
       const offset = buckets[index];
@@ -742,7 +1067,7 @@ export class RogueMap<K = any, V = any> {
         }
       }
 
-      index = (index + 1) % capacity;
+      index = (index + 1) & mask;
       if (index === start_index) return false;
     }
   }
@@ -759,12 +1084,12 @@ export class RogueMap<K = any, V = any> {
     }
 
     const hash = this.hasher(key) | 0;
-    const capacity = this.capacity;
     const buckets = this.buckets;
     const states = this.states;
     const hashes = this.hashes;
+    const mask = this.capacityMask;
 
-    let index = Math.abs(hash % capacity);
+    let index = Math.abs(hash) & mask;
     let start_index = index;
 
     // PRE-ENCODE KEY
@@ -775,6 +1100,61 @@ export class RogueMap<K = any, V = any> {
       );
     }
     this.keyCodec.encode(key, this.tempKeyBuffer, 0);
+
+    // === OPTIMIZED PATH ===
+    if (this.rawBuffer) {
+      const raw = this.rawBuffer;
+      const tempKey = this.tempKeyBuffer;
+      const keyFixed = this.keyCodec.fixedLength;
+      const valFixed = this.valueCodec.fixedLength;
+
+      while (true) {
+        const offset = buckets[index];
+        if (offset === 0) return false;
+
+        if (states[index] === FLAG_ACTIVE) {
+          if (hashes[index] === hash) {
+            // INLINE COMPARE
+            let cursor = offset + 5;
+            let storedKeyLen = keyLen;
+            if (keyFixed === undefined) {
+              // Manual Read KeyLen
+              storedKeyLen =
+                raw[cursor] |
+                (raw[cursor + 1] << 8) |
+                (raw[cursor + 2] << 16) |
+                (raw[cursor + 3] << 24);
+              cursor += 4;
+            }
+            if (valFixed === undefined) cursor += 4;
+
+            if (storedKeyLen === keyLen) {
+              // Manual Compare
+              let match = true;
+              for (let k = 0; k < keyLen; k++) {
+                if (raw[cursor + k] !== tempKey[k]) {
+                  match = false;
+                  break;
+                }
+              }
+
+              if (match) {
+                // MATCH! DELETE INLINE
+                raw[offset] = FLAG_DELETED;
+                states[index] = FLAG_DELETED;
+                this._size--;
+                this._deletedCount++;
+                this.checkCompaction();
+                return true;
+              }
+            }
+          }
+        }
+
+        index = (index + 1) & mask;
+        if (index === start_index) return false;
+      }
+    }
 
     while (true) {
       const offset = buckets[index];
@@ -794,7 +1174,7 @@ export class RogueMap<K = any, V = any> {
         }
       }
 
-      index = (index + 1) % capacity;
+      index = (index + 1) & mask;
       if (index === start_index) return false;
     }
   }

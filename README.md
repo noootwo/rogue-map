@@ -98,25 +98,25 @@ await map.init();
 
 | Type         | Write Time | Read Time | Heap Used   | Total RSS |
 | ------------ | ---------- | --------- | ----------- | --------- |
-| **Object**   | 3ms        | 1ms       | 0.61 MB     | 0.63 MB   |
-| **Map**      | 1ms        | 2ms       | 0.67 MB     | 0.47 MB   |
-| **RogueMap** | 11ms       | 8ms       | **0.04 MB** | 1.48 MB   |
+| **Object**   | 3ms        | 1ms       | 0.60 MB     | 0.39 MB   |
+| **Map**      | 1ms        | 1ms       | 0.67 MB     | 0.45 MB   |
+| **RogueMap** | 5ms        | 6ms       | **0.04 MB** | 0.38 MB   |
 
 ### 100k Items
 
 | Type         | Write Time | Read Time | Heap Used   | Total RSS |
 | ------------ | ---------- | --------- | ----------- | --------- |
-| **Object**   | 37ms       | 14ms      | 8.28 MB     | 10.66 MB  |
-| **Map**      | **12ms**   | **2ms**   | 5.79 MB     | 5.27 MB   |
-| **RogueMap** | 38ms       | 34ms      | **0.04 MB** | 20.55 MB  |
+| **Object**   | 33ms       | 10ms      | 8.30 MB     | 10.59 MB  |
+| **Map**      | **11ms**   | **2ms**   | 5.79 MB     | 5.44 MB   |
+| **RogueMap** | 26ms       | 23ms      | **0.03 MB** | 5.47 MB   |
 
 ### 1M Items
 
 | Type         | Write Time | Read Time | Heap Used   | Total RSS |
 | ------------ | ---------- | --------- | ----------- | --------- |
-| **Object**   | 533ms      | 278ms     | 77.75 MB    | 113.56 MB |
-| **Map**      | **300ms**  | **19ms**  | 57.75 MB    | 53.20 MB  |
-| **RogueMap** | 472ms      | 365ms     | **0.04 MB** | 64.75 MB  |
+| **Object**   | 479ms      | 205ms     | 70.89 MB    | 120.98 MB |
+| **Map**      | **229ms**  | **18ms**  | 50.89 MB    | 28.86 MB  |
+| **RogueMap** | 279ms      | 282ms     | **0.03 MB** | 37.72 MB  |
 
 ### 10M Items
 
@@ -124,15 +124,15 @@ await map.init();
 | ------------ | -------------- | --------- | ----------- | ---------- |
 | **Object**   | ❌ (OOM/Crash) | ❌        | -           | -          |
 | **Map**      | ❌ (OOM/Crash) | ❌        | -           | -          |
-| **RogueMap** | **~4.6s**      | **~4.5s** | **0.06 MB** | **404 MB** |
+| **RogueMap** | **~2.9s**      | **~2.9s** | **0.03 MB** | **391 MB** |
 
 ### 100M Items
 
-| Type         | Write Time | Read Time | Heap Used | Total RSS   |
-| ------------ | ---------- | --------- | --------- | ----------- |
-| **Object**   | ❌         | ❌        | -         | -           |
-| **Map**      | ❌         | ❌        | -         | -           |
-| **RogueMap** | **~56s**   | **~35s**  | **6 MB**  | **5.44 GB** |
+| Type         | Write Time | Read Time  | Heap Used   | Total RSS   |
+| ------------ | ---------- | ---------- | ----------- | ----------- |
+| **Object**   | ❌         | ❌         | -           | -           |
+| **Map**      | ❌         | ❌         | -           | -           |
+| **RogueMap** | **~54.5s** | **~44.1s** | **0.11 MB** | **3.63 GB** |
 
 > **Environment**: macOS, Node.js v22. (Single Thread)
 > **Conclusion**:
@@ -140,6 +140,28 @@ await map.init();
 > 1. **Small Scale (<100k)**: Native Map/Object are extremely fast. RogueMap has minor initial overhead.
 > 2. **Medium Scale (1M)**: RogueMap write performance catches up to Object, with near-zero Heap usage.
 > 3. **Large Scale (>10M)**: **RogueMap is the only viable choice**. Native structures crash or OOM, while RogueMap runs stably with minimal Heap impact.
+
+### Scenario 1: Small Objects (String -> Number)
+
+> Typical "Counter" or "ID Mapping" use case.
+
+| Metric          | Native Map (V8) | RogueMap    | Difference         |
+| --------------- | --------------- | ----------- | ------------------ |
+| **Write Time**  | ~229ms          | **~279ms**  | 21% Slower         |
+| **Read Time**   | ~18ms           | ~282ms      | 15x Slower         |
+| **Heap Memory** | ~50 MB          | **~0.1 MB** | **99% Less** 📉    |
+| **Total RSS**   | ~28 MB          | **~37 MB**  | Higher (Pre-alloc) |
+
+### Scenario 2: Large Objects (String -> JSON)
+
+> Storing complex objects. RogueMap serializes them (deep copy), while Native Map stores references.
+
+| Metric          | Native Map (V8) | RogueMap    | Difference             |
+| --------------- | --------------- | ----------- | ---------------------- |
+| **Write Time**  | ~296ms          | ~711ms      | 2.4x Slower (JSON Ser) |
+| **Heap Memory** | ~50 MB          | **~0.1 MB** | **99% Less**           |
+
+> **Key Takeaway**: For scalar data (numbers, short strings), RogueMap write performance is close to native Map. For complex objects, RogueMap trades CPU (serialization) for massive memory savings and off-heap storage.
 
 ## Advanced Optimization
 
@@ -156,8 +178,8 @@ const map = new RogueMap({
 
 | Scenario      | No Cache   | With Cache (Hot) |
 | ------------- | ---------- | ---------------- |
-| **Hot Read**  | ~158ms     | **~122ms**       |
-| **Cold Scan** | **~270ms** | ~800ms           |
+| **Hot Read**  | ~148ms     | **~84ms**        |
+| **Cold Scan** | **~279ms** | ~800ms           |
 
 > **Note**: Enabling cache adds overhead for cold scans (updating cache) but significantly speeds up repetitive access. Use it only if you have locality of reference.
 

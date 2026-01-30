@@ -30,6 +30,10 @@ export class PagedBuffer {
     this.singlePage = numPages === 1 ? this.pages[0] : null;
   }
 
+  getSinglePage(): Buffer | null {
+    return this.singlePage;
+  }
+
   get length(): number {
     return this._length;
   }
