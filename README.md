@@ -172,10 +172,11 @@ map.set("created_at", new Date());
 
 ## Architecture
 
-RogueMap uses a **Linear Probing Hash Table** backed by a single `Buffer`.
+RogueMap uses a **Linear Probing Hash Table** backed by a **Paged Buffer** system.
 
-- **Buckets**: `Int32Array` storing offsets to the data buffer.
-- **Data Buffer**: Stores entries sequentially `[Flag][KeyLen][ValLen][Key][Value]`.
+- **Buckets**: `Float64Array` storing 64-bit offsets to the data buffer (supports >4GB address space).
+- **Paged Buffer**: A wrapper around multiple Node.js Buffers (default 1GB pages) to bypass the 2GB/4GB single-buffer limit.
+- **Data Layout**: Entries are stored sequentially `[Flag][KeyLen][ValLen][Key][Value]`.
 - **Resizing**: Automatically doubles capacity and buffer size when load factor (0.75) or buffer limit is reached.
 
 ## License

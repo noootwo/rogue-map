@@ -1,5 +1,5 @@
-import { RogueMap } from "./src/RogueMap.js";
-import { Int32Codec, StringCodec, JSONCodec } from "./src/codecs.js";
+import { RogueMap } from "../src/RogueMap";
+import { Int32Codec, StringCodec, JSONCodec } from "../src/codecs";
 
 const ITERATIONS = 1_000_000;
 

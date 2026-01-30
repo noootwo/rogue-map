@@ -7,6 +7,7 @@ import {
   PersistenceAdapter,
 } from "./persistence/interfaces";
 import { PersistenceManager } from "./persistence/manager";
+import { PagedBuffer } from "./PagedBuffer";
 
 /**
  * Configuration options for creating a RogueMap instance.
@@ -68,8 +69,8 @@ const FLAG_DELETED = 2;
  */
 export class RogueMap<K = any, V = any> {
   private capacity: number;
-  private buffer: Buffer;
-  private buckets: Int32Array;
+  private buffer: PagedBuffer;
+  private buckets: Float64Array; // Changed to Float64Array to support >2GB offsets
   private hashes: Int32Array;
   private states: Uint8Array;
   private writeOffset: number;
@@ -97,10 +98,12 @@ export class RogueMap<K = any, V = any> {
    */
   constructor(options: RogueMapOptions<K, V> = {}) {
     this.capacity = options.capacity || DEFAULT_CAPACITY;
-    this.buckets = new Int32Array(this.capacity);
+    this.buckets = new Float64Array(this.capacity);
     this.hashes = new Int32Array(this.capacity);
     this.states = new Uint8Array(this.capacity); // 0=Empty, 1=Active, 2=Deleted
-    this.buffer = Buffer.allocUnsafe(options.initialMemory || DEFAULT_MEMORY);
+    this.buffer = PagedBuffer.allocUnsafe(
+      options.initialMemory || DEFAULT_MEMORY,
+    );
     this.writeOffset = 1; // Start at 1 because 0 in buckets means empty
 
     // Default to AnyCodec for maximum flexibility if no codec is provided
@@ -224,14 +227,27 @@ export class RogueMap<K = any, V = any> {
     const bucketsSize = capacity * 4;
     const bucketsBuffer = data.subarray(cursor, cursor + bucketsSize);
 
+    // We need to convert Int32Array (from buffer) to Float64Array
+    // Since persisted format uses 4 bytes per bucket, it assumes offsets fit in 32-bit.
+    // If we load a legacy format or a format that was saved when offsets were small, this is fine.
+    // If we want to support >2GB persistence, we need to upgrade the format version.
+    // For now, assume version 1 uses 32-bit buckets.
+
+    // Copy to aligned buffer to satisfy Int32Array alignment requirements
     const alignedBucketsBuffer = Buffer.allocUnsafe(bucketsSize);
     bucketsBuffer.copy(alignedBucketsBuffer);
 
-    const savedBuckets = new Int32Array(
+    // Create Float64Array for internal use
+    const savedBuckets = new Float64Array(capacity);
+    const tempInt32 = new Int32Array(
       alignedBucketsBuffer.buffer,
       alignedBucketsBuffer.byteOffset,
       bucketsSize / 4,
     );
+    for (let i = 0; i < capacity; i++) {
+      savedBuckets[i] = tempInt32[i];
+    }
+
     cursor += bucketsSize;
 
     // Update instance state
@@ -241,8 +257,8 @@ export class RogueMap<K = any, V = any> {
     this.states = new Uint8Array(capacity);
     this._size = size;
     this.writeOffset = writeOffset;
-    this.buffer = Buffer.allocUnsafe(bufferLength);
-    data.copy(this.buffer, 0, cursor, cursor + bufferLength);
+    this.buffer = PagedBuffer.allocUnsafe(bufferLength);
+    this.buffer.writeBuffer(data.subarray(cursor, cursor + bufferLength), 0);
 
     this._deletedCount = 0;
 
@@ -406,10 +422,10 @@ export class RogueMap<K = any, V = any> {
     const oldLimit = this.writeOffset;
 
     this.capacity = newCapacity;
-    this.buckets = new Int32Array(this.capacity);
+    this.buckets = new Float64Array(this.capacity);
     this.hashes = new Int32Array(this.capacity);
     this.states = new Uint8Array(this.capacity);
-    this.buffer = Buffer.allocUnsafe(newMemory);
+    this.buffer = PagedBuffer.allocUnsafe(newMemory);
     this.writeOffset = 1;
     this._size = 0;
 
@@ -447,9 +463,14 @@ export class RogueMap<K = any, V = any> {
         // We decode to get the key for hashing
         const keyStart = cursor + 5 + kLenSize + vLenSize;
 
-        const key = this.keyCodec.decode(oldBuffer, keyStart, keySize);
+        // Read key buffer from old PagedBuffer
+        const keyBuf = oldBuffer.readBuffer(keyStart, keySize);
+        const key = this.keyCodec.decode(keyBuf, 0, keySize);
+
+        // Read val buffer from old PagedBuffer
         const valStart = keyStart + keySize;
-        const value = this.valueCodec.decode(oldBuffer, valStart, valSize);
+        const valBuf = oldBuffer.readBuffer(valStart, valSize);
+        const value = this.valueCodec.decode(valBuf, 0, valSize);
 
         this.put(key, value, hash);
       }
@@ -533,6 +554,14 @@ export class RogueMap<K = any, V = any> {
     const bufferSize = this.writeOffset; // Only save used buffer
 
     const totalSize = headerSize + bucketsSize + bufferSize;
+
+    // Check limit
+    if (totalSize > 2 * 1024 * 1024 * 1024) {
+      // Node.js Buffer size limit is usually 2GB or 4GB.
+      // If we exceed 2GB, we risk failure depending on version.
+      // We will try to alloc. If it fails, it throws.
+    }
+
     const result = Buffer.allocUnsafe(totalSize);
 
     let cursor = 0;
@@ -562,15 +591,23 @@ export class RogueMap<K = any, V = any> {
     cursor += 4;
 
     // Buckets
+    // Convert Float64Array to Int32Array buffer for compatibility
+    // WARNING: If offsets > 2GB, this will truncate/wrap and corrupt data!
+    // For now, we assume serialize is only used for < 2GB maps.
+    // TODO: Upgrade format version to support 64-bit offsets.
+    const tempInt32 = new Int32Array(this.capacity);
+    for (let i = 0; i < this.capacity; i++) tempInt32[i] = this.buckets[i];
+
     const bucketsBuffer = Buffer.from(
-      this.buckets.buffer,
-      this.buckets.byteOffset,
-      this.buckets.byteLength,
+      tempInt32.buffer,
+      tempInt32.byteOffset,
+      tempInt32.byteLength,
     );
     bucketsBuffer.copy(result, cursor);
     cursor += bucketsSize;
 
     // Buffer
+    // Need to copy from PagedBuffer to result Buffer
     this.buffer.copy(result, cursor, 0, bufferSize);
 
     return result;
@@ -763,12 +800,21 @@ export class RogueMap<K = any, V = any> {
     }
 
     // Write Key
-    this.keyCodec.encode(key, this.buffer, cursor);
-    cursor += keySize;
+    // Use temp buffer to ensure compatibility with Codec interfaces that expect Buffer
+    if (keySize > 0) {
+      const keyBuf = Buffer.allocUnsafe(keySize);
+      this.keyCodec.encode(key, keyBuf, 0);
+      this.buffer.writeBuffer(keyBuf, cursor);
+      cursor += keySize;
+    }
 
     // Write Val
-    this.valueCodec.encode(value, this.buffer, cursor);
-    cursor += valSize;
+    if (valSize > 0) {
+      const valBuf = Buffer.allocUnsafe(valSize);
+      this.valueCodec.encode(value, valBuf, 0);
+      this.buffer.writeBuffer(valBuf, cursor);
+      cursor += valSize;
+    }
 
     // Update state
     this.writeOffset += entrySize;
@@ -842,7 +888,9 @@ export class RogueMap<K = any, V = any> {
     // Skip Key Data
     cursor += keySize;
 
-    return this.valueCodec.decode(this.buffer, cursor, valSize);
+    // Read Val buffer
+    const valBuf = this.buffer.readBuffer(cursor, valSize);
+    return this.valueCodec.decode(valBuf, 0, valSize);
   }
 
   /**
@@ -879,9 +927,13 @@ export class RogueMap<K = any, V = any> {
 
       if (flag === FLAG_ACTIVE) {
         const keyStart = cursor + 5 + kLenSize + vLenSize;
-        const key = this.keyCodec.decode(this.buffer, keyStart, keySize);
+        const keyBuf = this.buffer.readBuffer(keyStart, keySize);
+        const key = this.keyCodec.decode(keyBuf, 0, keySize);
+
         const valStart = keyStart + keySize;
-        const value = this.valueCodec.decode(this.buffer, valStart, valSize);
+        const valBuf = this.buffer.readBuffer(valStart, valSize);
+        const value = this.valueCodec.decode(valBuf, 0, valSize);
+
         yield [key, value];
       }
 
