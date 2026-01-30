@@ -136,16 +136,6 @@ const map = new RogueMap({
 
 > **Note**: Enabling cache adds overhead for cold scans (updating cache) but significantly speeds up repetitive access. Use it only if you have locality of reference.
 
-### Rust Integration (Optional)
-
-This project includes a proof-of-concept Rust accelerator in `native/`.
-To use it:
-
-```bash
-cd native && cargo build --release
-cp target/release/librogue_map_native.dylib native.node
-```
-
 ## API
 
 ### `new RogueMap(options)`
