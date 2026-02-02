@@ -1,6 +1,7 @@
 import { Codec } from "./interfaces";
 import { AnyCodec } from "./codecs";
 import { murmurHash3, numberHash } from "./utils";
+import { EventEmitter } from "events";
 import {
   PersistenceOptions,
   CompactionOptions,
@@ -52,12 +53,41 @@ export interface RogueMapOptions<K, V> {
    * Set to 0 to disable. Defaults to 0.
    */
   cacheSize?: number; // LRU Cache size (0 = disabled)
+  /**
+   * Default Time-To-Live (TTL) for entries in milliseconds.
+   * If set, entries will expire after this duration.
+   * Can be overridden per-entry in set().
+   */
+  ttl?: number;
+}
+
+/**
+ * Options for set() method.
+ */
+export interface SetOptions {
+  /**
+   * Time-To-Live (TTL) for this entry in milliseconds.
+   * Overrides the default TTL if set.
+   */
+  ttl?: number;
 }
 
 const DEFAULT_CAPACITY = 16384;
 const DEFAULT_MEMORY = 10 * 1024 * 1024; // 10MB
 const FLAG_ACTIVE = 1;
 const FLAG_DELETED = 2;
+// 8 bytes for TTL (ExpireAt) in Entry Header
+// Layout: [Flag(1)] [Hash(4)] [ExpireAt(8)] [KeyLen(4)?] [ValLen(4)?] [Key] [Val]
+// ExpireAt = 0 means no expiration (or very old format, but we init with 0 for no expiry)
+// Wait, 0 is 1970. We should use 0 to mean "persist".
+// If we use 0 as "no expiry", then expired check is: if (expireAt > 0 && now > expireAt).
+const TTL_SIZE = 8;
+const ENTRY_HEADER_SIZE_V1 = 5; // Flag(1) + Hash(4)
+const ENTRY_HEADER_SIZE_V2 = 13; // Flag(1) + Hash(4) + ExpireAt(8)
+// We need to detect version or force V2.
+// For simplicity in this iteration, we upgrade to V2 layout by default.
+// But this breaks persistence compatibility with V1 files.
+// We can bump version in serialize().
 
 /**
  * RogueMap: A high-performance, off-heap hash map for Node.js.
@@ -68,7 +98,7 @@ const FLAG_DELETED = 2;
  * @template K Type of keys (must be supported by keyCodec)
  * @template V Type of values (must be supported by valueCodec)
  */
-export class RogueMap<K = any, V = any> {
+export class RogueMap<K = any, V = any> extends EventEmitter {
   private capacity: number;
   private capacityMask: number; // Optimization: mask for modulo operations (capacity - 1)
   private buffer: PagedBuffer;
@@ -94,6 +124,7 @@ export class RogueMap<K = any, V = any> {
 
   private cache?: Map<K, V>;
   private cacheSize: number;
+  private defaultTTL: number;
 
   private tempKeyBuffer: Buffer = Buffer.allocUnsafe(1024); // Reusable buffer for key comparison
 
@@ -103,6 +134,7 @@ export class RogueMap<K = any, V = any> {
    * @param options Configuration options
    */
   constructor(options: RogueMapOptions<K, V> = {}) {
+    super();
     // Ensure capacity is power of 2 for fast modulo
     let cap = options.capacity || DEFAULT_CAPACITY;
     if ((cap & (cap - 1)) !== 0) {
@@ -128,6 +160,8 @@ export class RogueMap<K = any, V = any> {
     if (this.cacheSize > 0) {
       this.cache = new Map();
     }
+
+    this.defaultTTL = options.ttl || 0;
 
     if (options.hasher) {
       this.hasher = options.hasher;
@@ -218,8 +252,10 @@ export class RogueMap<K = any, V = any> {
     // Version
     const version = data.readUInt8(cursor);
     cursor += 1;
-    if (version !== 1)
-      throw new Error(`Unsupported RogueMap version: ${version}`);
+    if (version !== 2)
+      throw new Error(
+        `Unsupported RogueMap version: ${version}. Only version 2 is supported.`,
+      );
 
     // Capacity
     const capacity = data.readUInt32LE(cursor);
@@ -311,8 +347,9 @@ export class RogueMap<K = any, V = any> {
    *
    * @param key The key of the element to add to the RogueMap object.
    * @param value The value of the element to add to the RogueMap object.
+   * @param options Optional settings like TTL.
    */
-  set(key: K, value: V): void {
+  set(key: K, value: V, options?: SetOptions): void {
     if (this.cache) {
       // Update cache on write
       if (this.cache.has(key)) {
@@ -324,7 +361,11 @@ export class RogueMap<K = any, V = any> {
         // But if we just wrote it, we likely read it soon.
         if (this.cache.size >= this.cacheSize) {
           const oldestKey = this.cache.keys().next().value;
-          if (oldestKey !== undefined) this.cache.delete(oldestKey);
+          if (oldestKey !== undefined) {
+            const evictedVal = this.cache.get(oldestKey);
+            this.cache.delete(oldestKey);
+            this.emit("evict", oldestKey, evictedVal);
+          }
         }
         this.cache.set(key, value);
       }
@@ -336,8 +377,16 @@ export class RogueMap<K = any, V = any> {
 
     const hash = this.hasher(key) | 0;
 
+    // Calculate ExpireAt
+    let expireAt: number = 0; // 0 = no expiry
+    const ttl = options?.ttl !== undefined ? options.ttl : this.defaultTTL;
+    if (ttl > 0) {
+      expireAt = Date.now() + ttl;
+    }
+
     try {
-      this.put(key, value, hash);
+      this.put(key, value, hash, expireAt);
+      this.emit("set", key, value);
     } catch (e: any) {
       if (e.message === "RogueMap: Out of memory (Buffer full)") {
         // Calculate needed size roughly or just double repeatedly
@@ -350,7 +399,8 @@ export class RogueMap<K = any, V = any> {
         while (retries < 3) {
           this.resize(this.capacity, this.buffer.length * 2);
           try {
-            this.put(key, value, hash);
+            this.put(key, value, hash, expireAt);
+            this.emit("set", key, value);
             break; // Success
           } catch (retryErr: any) {
             if (retryErr.message === "RogueMap: Out of memory (Buffer full)") {
@@ -364,7 +414,8 @@ export class RogueMap<K = any, V = any> {
       } else if (e.message === "RogueMap: Hash table full") {
         // Should be caught by load factor check, but safe fallback
         this.resize(this.capacity * 2, this.buffer.length * 2);
-        this.put(key, value, hash);
+        this.put(key, value, hash, expireAt);
+        this.emit("set", key, value);
       } else {
         throw e;
       }
@@ -373,7 +424,7 @@ export class RogueMap<K = any, V = any> {
     this.checkCompaction();
   }
 
-  private put(key: K, value: V, hash: number): void {
+  private put(key: K, value: V, hash: number, expireAt: number): void {
     const hashes = this._hashes;
     const offsets = this._offsets;
     const mask = this.capacityMask;
@@ -410,7 +461,7 @@ export class RogueMap<K = any, V = any> {
 
           // INLINE WRITE ENTRY
           const valLen = this.valueCodec.byteLength(value);
-          let entrySize = 5; // Flag(1) + Hash(4)
+          let entrySize = 5 + 8; // Flag(1) + Hash(4) + ExpireAt(8)
           if (keyFixed === undefined) entrySize += 4;
           if (valFixed === undefined) entrySize += 4;
           entrySize += keyLen + valLen;
@@ -428,6 +479,21 @@ export class RogueMap<K = any, V = any> {
           raw[cursor + 2] = (hash >>> 16) & 0xff;
           raw[cursor + 3] = (hash >>> 24) & 0xff;
           cursor += 4;
+
+          // Write ExpireAt (Int64LE - split into two UInt32)
+          // Since JS Numbers are Doubles (53-bit integer precision), we can write as Low/High 32-bit.
+          // Date.now() fits in 53-bit.
+          const low = expireAt % 0x100000000;
+          const high = Math.floor(expireAt / 0x100000000);
+          raw[cursor] = low & 0xff;
+          raw[cursor + 1] = (low >>> 8) & 0xff;
+          raw[cursor + 2] = (low >>> 16) & 0xff;
+          raw[cursor + 3] = (low >>> 24) & 0xff;
+          raw[cursor + 4] = high & 0xff;
+          raw[cursor + 5] = (high >>> 8) & 0xff;
+          raw[cursor + 6] = (high >>> 16) & 0xff;
+          raw[cursor + 7] = (high >>> 24) & 0xff;
+          cursor += 8;
 
           if (keyFixed === undefined) {
             // Manual Write KeyLen (Int32LE)
@@ -472,7 +538,7 @@ export class RogueMap<K = any, V = any> {
           // Active
           if (storedHash === hash) {
             // INLINE COMPARE
-            let cursor = storedOffset + 5;
+            let cursor = storedOffset + 5 + 8; // Flag(1) + Hash(4) + ExpireAt(8)
             let storedKeyLen = keyLen;
             if (keyFixed === undefined) {
               // Manual Read KeyLen (Int32LE)
@@ -515,7 +581,7 @@ export class RogueMap<K = any, V = any> {
 
                 // Append new
                 const valLen = this.valueCodec.byteLength(value);
-                let entrySize = 5;
+                let entrySize = 5 + 8; // Header V2
                 if (keyFixed === undefined) entrySize += 4;
                 if (valFixed === undefined) entrySize += 4;
                 entrySize += keyLen + valLen;
@@ -533,6 +599,19 @@ export class RogueMap<K = any, V = any> {
                 raw[wCursor + 2] = (hash >>> 16) & 0xff;
                 raw[wCursor + 3] = (hash >>> 24) & 0xff;
                 wCursor += 4;
+
+                // Write ExpireAt
+                const low = expireAt % 0x100000000;
+                const high = Math.floor(expireAt / 0x100000000);
+                raw[wCursor] = low & 0xff;
+                raw[wCursor + 1] = (low >>> 8) & 0xff;
+                raw[wCursor + 2] = (low >>> 16) & 0xff;
+                raw[wCursor + 3] = (low >>> 24) & 0xff;
+                raw[wCursor + 4] = high & 0xff;
+                raw[wCursor + 5] = (high >>> 8) & 0xff;
+                raw[wCursor + 6] = (high >>> 16) & 0xff;
+                raw[wCursor + 7] = (high >>> 24) & 0xff;
+                wCursor += 8;
 
                 if (keyFixed === undefined) {
                   raw[wCursor] = keyLen & 0xff;
@@ -582,7 +661,7 @@ export class RogueMap<K = any, V = any> {
       if (storedOffset === 0) {
         // Found empty slot
         const finalIndex = tombstoneIndex !== -1 ? tombstoneIndex : index;
-        this.writeEntry(finalIndex, key, value, hash);
+        this.writeEntry(finalIndex, key, value, hash, expireAt);
         this._size++;
         return;
       }
@@ -600,7 +679,7 @@ export class RogueMap<K = any, V = any> {
             this._deletedCount++;
 
             // Append new entry and update bucket
-            this.writeEntry(index, key, value, hash);
+            this.writeEntry(index, key, value, hash, expireAt);
             return;
           }
         }
@@ -673,7 +752,7 @@ export class RogueMap<K = any, V = any> {
           (oldRaw[cursor + 3] << 16) |
           (oldRaw[cursor + 4] << 24);
 
-        let entryLen = 5;
+        let entryLen = 5 + 8; // V2 Header
         let keySize: number, valSize: number;
         let kLenSize = 0,
           vLenSize = 0;
@@ -682,17 +761,17 @@ export class RogueMap<K = any, V = any> {
           keySize = this.keyCodec.fixedLength;
         } else {
           keySize =
-            oldRaw[cursor + 5] |
-            (oldRaw[cursor + 6] << 8) |
-            (oldRaw[cursor + 7] << 16) |
-            (oldRaw[cursor + 8] << 24);
+            oldRaw[cursor + 5 + 8] |
+            (oldRaw[cursor + 6 + 8] << 8) |
+            (oldRaw[cursor + 7 + 8] << 16) |
+            (oldRaw[cursor + 8 + 8] << 24);
           kLenSize = 4;
         }
 
         if (this.valueCodec.fixedLength !== undefined) {
           valSize = this.valueCodec.fixedLength;
         } else {
-          const offset = cursor + 5 + kLenSize;
+          const offset = cursor + 5 + 8 + kLenSize;
           valSize =
             oldRaw[offset] |
             (oldRaw[offset + 1] << 8) |
@@ -748,7 +827,15 @@ export class RogueMap<K = any, V = any> {
         const flag = oldBuffer.readUInt8(cursor);
         const hash = oldBuffer.readInt32LE(cursor + 1);
 
-        let entryLen = 5;
+        // Read ExpireAt (new V2 layout)
+        // If resizing from old V1 layout... wait, we need to handle version migration?
+        // For simplicity, assume buffer layout is consistent within instance lifetime.
+        // We upgraded to V2 layout by default.
+        const low = oldBuffer.readUInt32LE(cursor + 5);
+        const high = oldBuffer.readUInt32LE(cursor + 9);
+        const expireAt = high * 0x100000000 + low;
+
+        let entryLen = 5 + 8;
         let keySize: number, valSize: number;
         let kLenSize = 0,
           vLenSize = 0;
@@ -756,21 +843,21 @@ export class RogueMap<K = any, V = any> {
         if (this.keyCodec.fixedLength !== undefined) {
           keySize = this.keyCodec.fixedLength;
         } else {
-          keySize = oldBuffer.readInt32LE(cursor + 5);
+          keySize = oldBuffer.readInt32LE(cursor + 5 + 8);
           kLenSize = 4;
         }
 
         if (this.valueCodec.fixedLength !== undefined) {
           valSize = this.valueCodec.fixedLength;
         } else {
-          valSize = oldBuffer.readInt32LE(cursor + 5 + kLenSize);
+          valSize = oldBuffer.readInt32LE(cursor + 5 + 8 + kLenSize);
           vLenSize = 4;
         }
 
         entryLen += kLenSize + vLenSize + keySize + valSize;
 
         if (flag === FLAG_ACTIVE) {
-          const keyStart = cursor + 5 + kLenSize + vLenSize;
+          const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
           const keyBuf = oldBuffer.readBuffer(keyStart, keySize);
           const key = this.keyCodec.decode(keyBuf, 0, keySize);
 
@@ -778,7 +865,7 @@ export class RogueMap<K = any, V = any> {
           const valBuf = oldBuffer.readBuffer(valStart, valSize);
           const value = this.valueCodec.decode(valBuf, 0, valSize);
 
-          this.put(key, value, hash);
+          this.put(key, value, hash, expireAt);
         }
         cursor += entryLen;
       }
@@ -797,7 +884,7 @@ export class RogueMap<K = any, V = any> {
     while (cursor < this.writeOffset) {
       const flag = this.buffer.readUInt8(cursor);
 
-      let entryLen = 5; // Flag + Hash
+      let entryLen = 5 + 8; // Flag + Hash + ExpireAt
 
       let keySize: number, valSize: number;
       let kLenSize = 0,
@@ -806,21 +893,50 @@ export class RogueMap<K = any, V = any> {
       if (this.keyCodec.fixedLength !== undefined) {
         keySize = this.keyCodec.fixedLength;
       } else {
-        keySize = this.buffer.readInt32LE(cursor + 5);
+        keySize = this.buffer.readInt32LE(cursor + 5 + 8);
         kLenSize = 4;
       }
 
       if (this.valueCodec.fixedLength !== undefined) {
         valSize = this.valueCodec.fixedLength;
       } else {
-        valSize = this.buffer.readInt32LE(cursor + 5 + kLenSize);
+        valSize = this.buffer.readInt32LE(cursor + 5 + 8 + kLenSize);
         vLenSize = 4;
       }
 
       const totalLen = entryLen + kLenSize + vLenSize + keySize + valSize;
 
       if (flag === FLAG_ACTIVE) {
-        requiredSize += totalLen;
+        // Check Expiration during compaction
+        const low = this.buffer.readUInt32LE(cursor + 5);
+        const high = this.buffer.readUInt32LE(cursor + 9);
+        const expireAt = high * 0x100000000 + low;
+
+        if (expireAt > 0 && Date.now() > expireAt) {
+          // Expired! Treat as deleted (don't copy)
+          // But compact logic copies ACTIVE. So we just skip adding to requiredSize.
+          // Wait, if we skip adding, resize() will skip it too?
+          // resize() iterates old buffer. We need to mark it DELETED before resize?
+          // Or compact() calls resize() which does the copying.
+          // The current compact() implementation calculates size then calls resize().
+          // resize() iterates again.
+          // Optimization: Mark as DELETED here so resize() skips it.
+
+          // Decode key for event
+          const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
+          // Use readBuffer to be safe across pages (though compact implies we might be iterating)
+          const keyBuf = this.buffer.readBuffer(keyStart, keySize);
+          const key = this.keyCodec.decode(keyBuf, 0, keySize);
+          this.emit("expire", key);
+
+          this.buffer.writeUInt8(FLAG_DELETED, cursor);
+          // We should also update index? But resize() rebuilds index from scratch.
+          // So marking buffer as DELETED is enough for resize() to skip it.
+          this._deletedCount++;
+          this._size--; // Decrement size
+        } else {
+          requiredSize += totalLen;
+        }
       }
 
       cursor += totalLen;
@@ -845,7 +961,7 @@ export class RogueMap<K = any, V = any> {
   serialize(): Buffer {
     // Format:
     // [Magic: ROGUE(5)]
-    // [Version: 1(1)]
+    // [Version: 2(1)] (Bump to 2 for TTL support)
     // [Capacity: 4]
     // [Size: 4]
     // [WriteOffset: 4]
@@ -877,7 +993,7 @@ export class RogueMap<K = any, V = any> {
     cursor += 5;
 
     // Version
-    result.writeUInt8(1, cursor);
+    result.writeUInt8(2, cursor);
     cursor += 1;
 
     // Capacity
@@ -1009,7 +1125,7 @@ export class RogueMap<K = any, V = any> {
             const tempKey = this.tempKeyBuffer;
 
             // INLINE COMPARE
-            let cursor = storedOffset + 5;
+            let cursor = storedOffset + 5 + 8;
             let storedKeyLen = keyLen;
             if (keyFixed === undefined) {
               // Manual Read KeyLen
@@ -1041,8 +1157,33 @@ export class RogueMap<K = any, V = any> {
               }
 
               if (match) {
+                // Check ExpireAt
+                const eCursor = storedOffset + 5;
+                const low =
+                  raw[eCursor] |
+                  (raw[eCursor + 1] << 8) |
+                  (raw[eCursor + 2] << 16) |
+                  (raw[eCursor + 3] << 24);
+                const high =
+                  raw[eCursor + 4] |
+                  (raw[eCursor + 5] << 8) |
+                  (raw[eCursor + 6] << 16) |
+                  (raw[eCursor + 7] << 24);
+                const expireAt = high * 0x100000000 + low;
+
+                if (expireAt > 0 && Date.now() > expireAt) {
+                  // Lazy Delete
+                  raw[storedOffset] = FLAG_DELETED;
+                  offsets[index] = -storedOffset;
+                  this._deletedCount++;
+                  this._size--;
+                  this.checkCompaction();
+                  this.emit("expire", key);
+                  return undefined;
+                }
+
                 // MATCH! READ VALUE INLINE
-                let vCursor = storedOffset + 5;
+                let vCursor = storedOffset + 5 + 8;
                 if (keyFixed === undefined) vCursor += 4;
 
                 let valLen: number;
@@ -1061,15 +1202,18 @@ export class RogueMap<K = any, V = any> {
                 vCursor += keyLen; // Skip Key
 
                 // Read Val
-                // Use subarray to be safe with codecs expecting buffer from 0
-                const valBuf = raw.subarray(vCursor, vCursor + valLen);
-                const val = this.valueCodec.decode(valBuf, 0, valLen);
+                // Use Zero-Copy decoding if possible
+                const val = this.valueCodec.decode(raw, vCursor, valLen);
 
                 // Update Cache
                 if (this.cache) {
                   if (this.cache.size >= this.cacheSize) {
                     const oldestKey = this.cache.keys().next().value;
-                    if (oldestKey !== undefined) this.cache.delete(oldestKey);
+                    if (oldestKey !== undefined) {
+                      const evictedVal = this.cache.get(oldestKey);
+                      this.cache.delete(oldestKey);
+                      this.emit("evict", oldestKey, evictedVal);
+                    }
                   }
                   this.cache.set(key, val);
                 }
@@ -1096,13 +1240,32 @@ export class RogueMap<K = any, V = any> {
         if (storedHash === hash) {
           ensureEncoded();
           if (this.keyMatchesPreEncoded(storedOffset, keyLen)) {
+            // Check Expiration
+            const low = this.buffer.readUInt32LE(storedOffset + 5);
+            const high = this.buffer.readUInt32LE(storedOffset + 9);
+            const expireAt = high * 0x100000000 + low;
+
+            if (expireAt > 0 && Date.now() > expireAt) {
+              this.buffer.writeUInt8(FLAG_DELETED, storedOffset);
+              offsets[index] = -storedOffset;
+              this._deletedCount++;
+              this._size--;
+              this.checkCompaction();
+              this.emit("expire", key);
+              return undefined;
+            }
+
             const val = this.readValue(storedOffset);
             // Update Cache
             if (this.cache) {
               if (this.cache.size >= this.cacheSize) {
                 // Evict oldest (first key)
                 const oldestKey = this.cache.keys().next().value;
-                if (oldestKey !== undefined) this.cache.delete(oldestKey);
+                if (oldestKey !== undefined) {
+                  const evictedVal = this.cache.get(oldestKey);
+                  this.cache.delete(oldestKey);
+                  this.emit("evict", oldestKey, evictedVal);
+                }
               }
               this.cache.set(key, val);
             }
@@ -1165,7 +1328,7 @@ export class RogueMap<K = any, V = any> {
             // INLINE COMPARE
             ensureEncoded();
             const tempKey = this.tempKeyBuffer;
-            let cursor = storedOffset + 5;
+            let cursor = storedOffset + 5 + 8;
             let storedKeyLen = keyLen;
             if (keyFixed === undefined) {
               // Manual Read KeyLen
@@ -1195,6 +1358,30 @@ export class RogueMap<K = any, V = any> {
               }
 
               if (match) {
+                // Check Expiration
+                const eCursor = storedOffset + 5;
+                const low =
+                  raw[eCursor] |
+                  (raw[eCursor + 1] << 8) |
+                  (raw[eCursor + 2] << 16) |
+                  (raw[eCursor + 3] << 24);
+                const high =
+                  raw[eCursor + 4] |
+                  (raw[eCursor + 5] << 8) |
+                  (raw[eCursor + 6] << 16) |
+                  (raw[eCursor + 7] << 24);
+                const expireAt = high * 0x100000000 + low;
+
+                if (expireAt > 0 && Date.now() > expireAt) {
+                  // Lazy Delete
+                  raw[storedOffset] = FLAG_DELETED;
+                  offsets[index] = -storedOffset;
+                  this._deletedCount++;
+                  this._size--;
+                  this.checkCompaction();
+                  this.emit("expire", key);
+                  return false;
+                }
                 return true;
               }
             }
@@ -1217,7 +1404,23 @@ export class RogueMap<K = any, V = any> {
         // Active
         if (storedHash === hash) {
           ensureEncoded();
-          if (this.keyMatchesPreEncoded(storedOffset, keyLen)) return true;
+          if (this.keyMatchesPreEncoded(storedOffset, keyLen)) {
+            // Check Expiration
+            const low = this.buffer.readUInt32LE(storedOffset + 5);
+            const high = this.buffer.readUInt32LE(storedOffset + 9);
+            const expireAt = high * 0x100000000 + low;
+
+            if (expireAt > 0 && Date.now() > expireAt) {
+              this.buffer.writeUInt8(FLAG_DELETED, storedOffset);
+              offsets[index] = -storedOffset;
+              this._deletedCount++;
+              this._size--;
+              this.checkCompaction();
+              this.emit("expire", key);
+              return false;
+            }
+            return true;
+          }
         }
       }
 
@@ -1279,7 +1482,7 @@ export class RogueMap<K = any, V = any> {
             // INLINE COMPARE
             ensureEncoded();
             const tempKey = this.tempKeyBuffer;
-            let cursor = storedOffset + 5;
+            let cursor = storedOffset + 5 + 8;
             let storedKeyLen = keyLen;
             if (keyFixed === undefined) {
               // Manual Read KeyLen
@@ -1309,12 +1512,38 @@ export class RogueMap<K = any, V = any> {
               }
 
               if (match) {
+                // Check Expiration
+                const eCursor = storedOffset + 5;
+                const low =
+                  raw[eCursor] |
+                  (raw[eCursor + 1] << 8) |
+                  (raw[eCursor + 2] << 16) |
+                  (raw[eCursor + 3] << 24);
+                const high =
+                  raw[eCursor + 4] |
+                  (raw[eCursor + 5] << 8) |
+                  (raw[eCursor + 6] << 16) |
+                  (raw[eCursor + 7] << 24);
+                const expireAt = high * 0x100000000 + low;
+
+                if (expireAt > 0 && Date.now() > expireAt) {
+                  // Lazy Delete (return false as if not found)
+                  raw[storedOffset] = FLAG_DELETED;
+                  offsets[index] = -storedOffset;
+                  this._deletedCount++;
+                  this._size--;
+                  this.checkCompaction();
+                  this.emit("expire", key);
+                  return false;
+                }
+
                 // MATCH! DELETE INLINE
                 raw[storedOffset] = FLAG_DELETED;
                 offsets[index] = -storedOffset; // Mark deleted
                 this._size--;
                 this._deletedCount++;
                 this.checkCompaction();
+                this.emit("delete", key);
                 return true;
               }
             }
@@ -1338,11 +1567,27 @@ export class RogueMap<K = any, V = any> {
         if (storedHash === hash) {
           ensureEncoded();
           if (this.keyMatchesPreEncoded(storedOffset, keyLen)) {
+            // Check Expiration
+            const low = this.buffer.readUInt32LE(storedOffset + 5);
+            const high = this.buffer.readUInt32LE(storedOffset + 9);
+            const expireAt = high * 0x100000000 + low;
+
+            if (expireAt > 0 && Date.now() > expireAt) {
+              this.buffer.writeUInt8(FLAG_DELETED, storedOffset);
+              offsets[index] = -storedOffset;
+              this._deletedCount++;
+              this._size--;
+              this.checkCompaction();
+              this.emit("expire", key);
+              return false;
+            }
+
             this.buffer.writeUInt8(FLAG_DELETED, storedOffset);
             offsets[index] = -storedOffset; // Update state
             this._size--;
             this._deletedCount++;
             this.checkCompaction();
+            this.emit("delete", key);
             return true;
           }
         }
@@ -1365,9 +1610,16 @@ export class RogueMap<K = any, V = any> {
     this.writeOffset = 1;
     this._size = 0;
     this._deletedCount = 0;
+    this.emit("clear");
   }
 
-  private writeEntry(index: number, key: K, value: V, hash: number) {
+  private writeEntry(
+    index: number,
+    key: K,
+    value: V,
+    hash: number,
+    expireAt: number,
+  ) {
     // Calculate size
     const keySize = this.keyCodec.byteLength(key);
     const valSize = this.valueCodec.byteLength(value);
@@ -1375,8 +1627,8 @@ export class RogueMap<K = any, V = any> {
     const keyFixed = this.keyCodec.fixedLength !== undefined;
     const valFixed = this.valueCodec.fixedLength !== undefined;
 
-    // Layout: [Flag(1)] [Hash(4)] [KeyLen(4)?] [ValLen(4)?] [Key] [Val]
-    let entrySize = 5; // Flag + Hash
+    // Layout: [Flag(1)] [Hash(4)] [ExpireAt(8)] [KeyLen(4)?] [ValLen(4)?] [Key] [Val]
+    let entrySize = 5 + 8; // Flag + Hash + ExpireAt
     if (!keyFixed) entrySize += 4;
     if (!valFixed) entrySize += 4;
     entrySize += keySize + valSize;
@@ -1396,6 +1648,13 @@ export class RogueMap<K = any, V = any> {
     // Write Hash
     this.buffer.writeInt32LE(hash, cursor);
     cursor += 4;
+
+    // Write ExpireAt (Int64LE)
+    const low = expireAt % 0x100000000;
+    const high = Math.floor(expireAt / 0x100000000);
+    this.buffer.writeUInt32LE(low, cursor);
+    this.buffer.writeUInt32LE(high, cursor + 4);
+    cursor += 8;
 
     // Write Key Len
     if (!keyFixed) {
@@ -1434,7 +1693,7 @@ export class RogueMap<K = any, V = any> {
   }
 
   private keyMatchesPreEncoded(offset: number, keyLen: number): boolean {
-    let cursor = offset + 5; // Skip Flag(1) + Hash(4)
+    let cursor = offset + 5 + 8; // Skip Flag(1) + Hash(4) + ExpireAt(8)
 
     let keySize: number;
     if (this.keyCodec.fixedLength !== undefined) {
@@ -1453,6 +1712,7 @@ export class RogueMap<K = any, V = any> {
     if (keyLen !== keySize) return false;
 
     // Zero-Allocation Compare: Use pre-encoded key
+    // For UCS-2, byte comparison is valid (same bytes)
     return (
       this.buffer.compare(
         this.tempKeyBuffer,
@@ -1467,7 +1727,7 @@ export class RogueMap<K = any, V = any> {
   private keyMatches(offset: number, key: K): boolean {
     // Deprecated in favor of keyMatchesPreEncoded, keeping just in case or for testing
     // Logic is same as before
-    let cursor = offset + 5; // Skip Flag(1) + Hash(4)
+    let cursor = offset + 5 + 8; // Skip Flag(1) + Hash(4) + ExpireAt(8)
 
     let keySize: number;
     if (this.keyCodec.fixedLength !== undefined) {
@@ -1503,7 +1763,7 @@ export class RogueMap<K = any, V = any> {
   }
 
   private readValue(offset: number): V {
-    let cursor = offset + 5; // Skip Flag(1) + Hash(4)
+    let cursor = offset + 5 + 8; // Skip Flag(1) + Hash(4) + ExpireAt(8)
 
     // Read/Skip KeyLen
     let keySize: number;
@@ -1526,9 +1786,32 @@ export class RogueMap<K = any, V = any> {
     // Skip Key Data
     cursor += keySize;
 
-    // Read Val buffer
+    // Zero-Copy Read
+    const view = this.buffer.tryGetView(cursor, valSize);
+    if (view) {
+      return this.valueCodec.decode(view.buffer, view.offset, valSize);
+    }
+
+    // Fallback for cross-page reads
     const valBuf = this.buffer.readBuffer(cursor, valSize);
     return this.valueCodec.decode(valBuf, 0, valSize);
+  }
+
+  /**
+   * Returns a new Async Iterator object that contains the [key, value] pairs for each element in the RogueMap object.
+   * This iterator yields execution to the event loop every `batchSize` items to avoid blocking the main thread.
+   *
+   * @param batchSize Number of items to yield before pausing (default: 100).
+   */
+  async *asyncEntries(batchSize: number = 100): AsyncIterableIterator<[K, V]> {
+    let count = 0;
+    for (const entry of this.entries()) {
+      yield entry;
+      count++;
+      if (count % batchSize === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    }
   }
 
   /**
@@ -1547,7 +1830,7 @@ export class RogueMap<K = any, V = any> {
       while (cursor < limit) {
         const flag = raw[cursor]; // raw.readUInt8(cursor)
 
-        let entryLen = 5;
+        let entryLen = 5 + 8; // V2 Header
         let keySize: number, valSize: number;
         let kLenSize = 0,
           vLenSize = 0;
@@ -1557,10 +1840,10 @@ export class RogueMap<K = any, V = any> {
         } else {
           // Manual Read KeyLen
           keySize =
-            raw[cursor + 5] |
-            (raw[cursor + 6] << 8) |
-            (raw[cursor + 7] << 16) |
-            (raw[cursor + 8] << 24);
+            raw[cursor + 5 + 8] |
+            (raw[cursor + 6 + 8] << 8) |
+            (raw[cursor + 7 + 8] << 16) |
+            (raw[cursor + 8 + 8] << 24);
           kLenSize = 4;
         }
 
@@ -1568,7 +1851,7 @@ export class RogueMap<K = any, V = any> {
           valSize = valFixed;
         } else {
           // Manual Read ValLen
-          const offset = cursor + 5 + kLenSize;
+          const offset = cursor + 5 + 8 + kLenSize;
           valSize =
             raw[offset] |
             (raw[offset + 1] << 8) |
@@ -1580,16 +1863,29 @@ export class RogueMap<K = any, V = any> {
         entryLen += kLenSize + vLenSize + keySize + valSize;
 
         if (flag === FLAG_ACTIVE) {
-          const keyStart = cursor + 5 + kLenSize + vLenSize;
-          // Use subarray for zero-copy view if codec supports it
-          const keyBuf = raw.subarray(keyStart, keyStart + keySize);
-          const key = this.keyCodec.decode(keyBuf, 0, keySize);
+          // Check ExpireAt
+          const low =
+            raw[cursor + 5] |
+            (raw[cursor + 6] << 8) |
+            (raw[cursor + 7] << 16) |
+            (raw[cursor + 8] << 24);
+          const high =
+            raw[cursor + 9] |
+            (raw[cursor + 10] << 8) |
+            (raw[cursor + 11] << 16) |
+            (raw[cursor + 12] << 24);
+          const expireAt = high * 0x100000000 + low; // 0x100000000 is 2^32
 
-          const valStart = keyStart + keySize;
-          const valBuf = raw.subarray(valStart, valStart + valSize);
-          const value = this.valueCodec.decode(valBuf, 0, valSize);
+          if (expireAt === 0 || Date.now() <= expireAt) {
+            const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
+            // Use zero-copy view if codec supports it
+            const key = this.keyCodec.decode(raw, keyStart, keySize);
 
-          yield [key, value];
+            const valStart = keyStart + keySize;
+            const value = this.valueCodec.decode(raw, valStart, valSize);
+
+            yield [key, value];
+          }
         }
 
         cursor += entryLen;
@@ -1602,8 +1898,8 @@ export class RogueMap<K = any, V = any> {
     while (cursor < this.writeOffset) {
       const flag = this.buffer.readUInt8(cursor);
 
-      // Layout: [Flag(1)] [Hash(4)] [KeyLen(4)?] [ValLen(4)?] [Key] [Val]
-      let entryLen = 5;
+      // Layout: [Flag(1)] [Hash(4)] [ExpireAt(8)] [KeyLen(4)?] [ValLen(4)?] [Key] [Val]
+      let entryLen = 5 + 8;
 
       let keySize: number, valSize: number;
       let kLenSize = 0,
@@ -1612,29 +1908,35 @@ export class RogueMap<K = any, V = any> {
       if (this.keyCodec.fixedLength !== undefined) {
         keySize = this.keyCodec.fixedLength;
       } else {
-        keySize = this.buffer.readInt32LE(cursor + 5);
+        keySize = this.buffer.readInt32LE(cursor + 5 + 8);
         kLenSize = 4;
       }
 
       if (this.valueCodec.fixedLength !== undefined) {
         valSize = this.valueCodec.fixedLength;
       } else {
-        valSize = this.buffer.readInt32LE(cursor + 5 + kLenSize);
+        valSize = this.buffer.readInt32LE(cursor + 5 + 8 + kLenSize);
         vLenSize = 4;
       }
 
       entryLen += kLenSize + vLenSize + keySize + valSize;
 
       if (flag === FLAG_ACTIVE) {
-        const keyStart = cursor + 5 + kLenSize + vLenSize;
-        const keyBuf = this.buffer.readBuffer(keyStart, keySize);
-        const key = this.keyCodec.decode(keyBuf, 0, keySize);
+        const low = this.buffer.readUInt32LE(cursor + 5);
+        const high = this.buffer.readUInt32LE(cursor + 9);
+        const expireAt = high * 0x100000000 + low;
 
-        const valStart = keyStart + keySize;
-        const valBuf = this.buffer.readBuffer(valStart, valSize);
-        const value = this.valueCodec.decode(valBuf, 0, valSize);
+        if (expireAt === 0 || Date.now() <= expireAt) {
+          const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
+          const keyBuf = this.buffer.readBuffer(keyStart, keySize);
+          const key = this.keyCodec.decode(keyBuf, 0, keySize);
 
-        yield [key, value];
+          const valStart = keyStart + keySize;
+          const valBuf = this.buffer.readBuffer(valStart, valSize);
+          const value = this.valueCodec.decode(valBuf, 0, valSize);
+
+          yield [key, value];
+        }
       }
 
       cursor += entryLen;
@@ -1656,7 +1958,7 @@ export class RogueMap<K = any, V = any> {
       while (cursor < limit) {
         const flag = raw[cursor];
 
-        let entryLen = 5;
+        let entryLen = 5 + 8; // V2 Header
         let keySize: number, valSize: number;
         let kLenSize = 0,
           vLenSize = 0;
@@ -1665,17 +1967,17 @@ export class RogueMap<K = any, V = any> {
           keySize = keyFixed;
         } else {
           keySize =
-            raw[cursor + 5] |
-            (raw[cursor + 6] << 8) |
-            (raw[cursor + 7] << 16) |
-            (raw[cursor + 8] << 24);
+            raw[cursor + 5 + 8] |
+            (raw[cursor + 6 + 8] << 8) |
+            (raw[cursor + 7 + 8] << 16) |
+            (raw[cursor + 8 + 8] << 24);
           kLenSize = 4;
         }
 
         if (valFixed !== undefined) {
           valSize = valFixed;
         } else {
-          const offset = cursor + 5 + kLenSize;
+          const offset = cursor + 5 + 8 + kLenSize;
           valSize =
             raw[offset] |
             (raw[offset + 1] << 8) |
@@ -1687,11 +1989,25 @@ export class RogueMap<K = any, V = any> {
         entryLen += kLenSize + vLenSize + keySize + valSize;
 
         if (flag === FLAG_ACTIVE) {
-          const keyStart = cursor + 5 + kLenSize + vLenSize;
-          // LAZY DECODING: Only decode key
-          const keyBuf = raw.subarray(keyStart, keyStart + keySize);
-          const key = this.keyCodec.decode(keyBuf, 0, keySize);
-          yield key;
+          // Check ExpireAt
+          const low =
+            raw[cursor + 5] |
+            (raw[cursor + 6] << 8) |
+            (raw[cursor + 7] << 16) |
+            (raw[cursor + 8] << 24);
+          const high =
+            raw[cursor + 9] |
+            (raw[cursor + 10] << 8) |
+            (raw[cursor + 11] << 16) |
+            (raw[cursor + 12] << 24);
+          const expireAt = high * 0x100000000 + low;
+
+          if (expireAt === 0 || Date.now() <= expireAt) {
+            const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
+            // LAZY DECODING: Only decode key
+            const key = this.keyCodec.decode(raw, keyStart, keySize);
+            yield key;
+          }
         }
 
         cursor += entryLen;
@@ -1703,7 +2019,7 @@ export class RogueMap<K = any, V = any> {
     let cursor = 1;
     while (cursor < this.writeOffset) {
       const flag = this.buffer.readUInt8(cursor);
-      let entryLen = 5;
+      let entryLen = 5 + 8; // V2 Header
       let keySize: number, valSize: number;
       let kLenSize = 0,
         vLenSize = 0;
@@ -1711,24 +2027,31 @@ export class RogueMap<K = any, V = any> {
       if (this.keyCodec.fixedLength !== undefined) {
         keySize = this.keyCodec.fixedLength;
       } else {
-        keySize = this.buffer.readInt32LE(cursor + 5);
+        keySize = this.buffer.readInt32LE(cursor + 5 + 8);
         kLenSize = 4;
       }
 
       if (this.valueCodec.fixedLength !== undefined) {
         valSize = this.valueCodec.fixedLength;
       } else {
-        valSize = this.buffer.readInt32LE(cursor + 5 + kLenSize);
+        valSize = this.buffer.readInt32LE(cursor + 5 + 8 + kLenSize);
         vLenSize = 4;
       }
 
       entryLen += kLenSize + vLenSize + keySize + valSize;
 
       if (flag === FLAG_ACTIVE) {
-        const keyStart = cursor + 5 + kLenSize + vLenSize;
-        const keyBuf = this.buffer.readBuffer(keyStart, keySize);
-        const key = this.keyCodec.decode(keyBuf, 0, keySize);
-        yield key;
+        // Check ExpireAt
+        const low = this.buffer.readUInt32LE(cursor + 5);
+        const high = this.buffer.readUInt32LE(cursor + 9);
+        const expireAt = high * 0x100000000 + low;
+
+        if (expireAt === 0 || Date.now() <= expireAt) {
+          const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
+          const keyBuf = this.buffer.readBuffer(keyStart, keySize);
+          const key = this.keyCodec.decode(keyBuf, 0, keySize);
+          yield key;
+        }
       }
 
       cursor += entryLen;
@@ -1750,7 +2073,7 @@ export class RogueMap<K = any, V = any> {
       while (cursor < limit) {
         const flag = raw[cursor];
 
-        let entryLen = 5;
+        let entryLen = 5 + 8; // V2 Header
         let keySize: number, valSize: number;
         let kLenSize = 0,
           vLenSize = 0;
@@ -1759,17 +2082,17 @@ export class RogueMap<K = any, V = any> {
           keySize = keyFixed;
         } else {
           keySize =
-            raw[cursor + 5] |
-            (raw[cursor + 6] << 8) |
-            (raw[cursor + 7] << 16) |
-            (raw[cursor + 8] << 24);
+            raw[cursor + 5 + 8] |
+            (raw[cursor + 6 + 8] << 8) |
+            (raw[cursor + 7 + 8] << 16) |
+            (raw[cursor + 8 + 8] << 24);
           kLenSize = 4;
         }
 
         if (valFixed !== undefined) {
           valSize = valFixed;
         } else {
-          const offset = cursor + 5 + kLenSize;
+          const offset = cursor + 5 + 8 + kLenSize;
           valSize =
             raw[offset] |
             (raw[offset + 1] << 8) |
@@ -1781,12 +2104,26 @@ export class RogueMap<K = any, V = any> {
         entryLen += kLenSize + vLenSize + keySize + valSize;
 
         if (flag === FLAG_ACTIVE) {
-          // LAZY DECODING: Only decode value
-          const keyStart = cursor + 5 + kLenSize + vLenSize;
-          const valStart = keyStart + keySize;
-          const valBuf = raw.subarray(valStart, valStart + valSize);
-          const value = this.valueCodec.decode(valBuf, 0, valSize);
-          yield value;
+          // Check ExpireAt
+          const low =
+            raw[cursor + 5] |
+            (raw[cursor + 6] << 8) |
+            (raw[cursor + 7] << 16) |
+            (raw[cursor + 8] << 24);
+          const high =
+            raw[cursor + 9] |
+            (raw[cursor + 10] << 8) |
+            (raw[cursor + 11] << 16) |
+            (raw[cursor + 12] << 24);
+          const expireAt = high * 0x100000000 + low;
+
+          if (expireAt === 0 || Date.now() <= expireAt) {
+            // LAZY DECODING: Only decode value
+            const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
+            const valStart = keyStart + keySize;
+            const value = this.valueCodec.decode(raw, valStart, valSize);
+            yield value;
+          }
         }
 
         cursor += entryLen;
@@ -1798,7 +2135,7 @@ export class RogueMap<K = any, V = any> {
     let cursor = 1;
     while (cursor < this.writeOffset) {
       const flag = this.buffer.readUInt8(cursor);
-      let entryLen = 5;
+      let entryLen = 5 + 8; // V2 Header
       let keySize: number, valSize: number;
       let kLenSize = 0,
         vLenSize = 0;
@@ -1806,25 +2143,32 @@ export class RogueMap<K = any, V = any> {
       if (this.keyCodec.fixedLength !== undefined) {
         keySize = this.keyCodec.fixedLength;
       } else {
-        keySize = this.buffer.readInt32LE(cursor + 5);
+        keySize = this.buffer.readInt32LE(cursor + 5 + 8);
         kLenSize = 4;
       }
 
       if (this.valueCodec.fixedLength !== undefined) {
         valSize = this.valueCodec.fixedLength;
       } else {
-        valSize = this.buffer.readInt32LE(cursor + 5 + kLenSize);
+        valSize = this.buffer.readInt32LE(cursor + 5 + 8 + kLenSize);
         vLenSize = 4;
       }
 
       entryLen += kLenSize + vLenSize + keySize + valSize;
 
       if (flag === FLAG_ACTIVE) {
-        const keyStart = cursor + 5 + kLenSize + vLenSize;
-        const valStart = keyStart + keySize;
-        const valBuf = this.buffer.readBuffer(valStart, valSize);
-        const value = this.valueCodec.decode(valBuf, 0, valSize);
-        yield value;
+        // Check ExpireAt
+        const low = this.buffer.readUInt32LE(cursor + 5);
+        const high = this.buffer.readUInt32LE(cursor + 9);
+        const expireAt = high * 0x100000000 + low;
+
+        if (expireAt === 0 || Date.now() <= expireAt) {
+          const keyStart = cursor + 5 + 8 + kLenSize + vLenSize;
+          const valStart = keyStart + keySize;
+          const valBuf = this.buffer.readBuffer(valStart, valSize);
+          const value = this.valueCodec.decode(valBuf, 0, valSize);
+          yield value;
+        }
       }
 
       cursor += entryLen;

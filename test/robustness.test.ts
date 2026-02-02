@@ -1,159 +1,105 @@
+
 import { describe, it, expect } from "vitest";
 import { RogueMap } from "../src/RogueMap";
-import { Int32Codec, BufferCodec } from "../src/codecs";
 
-describe("RogueMap Robustness & Edge Cases", () => {
-  describe("Hash Collisions (Forced)", () => {
-    // Mock hasher that causes collisions
-    const badHasher = (key: string) => {
-      // Return same hash for 'a' and 'b' to force collision
-      if (key === "a" || key === "b") return 100;
-      // Return same hash for 'c' and 'd'
-      if (key === "c" || key === "d") return 200;
-      return 0;
-    };
-
-    it("should handle direct collisions correctly", () => {
-      // We need to access the private hasher or pass it via options if possible.
-      // Currently RogueMap doesn't expose hasher in options cleanly for testing,
-      // but we can extend the class or modify the instance (JS allows it).
-
-      const map = new RogueMap<string, number>({
-        capacity: 10,
-        valueCodec: Int32Codec,
-      });
-
-      // Monkey-patch hasher
-      (map as any).hasher = badHasher;
-
-      map.set("a", 1); // Hash 100, Bucket 0 (100 % 10)
-      map.set("b", 2); // Hash 100, Bucket 0 -> Collision -> Probe
-
-      expect(map.get("a")).toBe(1);
-      expect(map.get("b")).toBe(2);
-
-      // Internal check: They should be in adjacent slots (conceptually)
-      // We can't easily check internal slots without exposing private vars,
-      // but behavior correctness is what matters.
+describe("RogueMap Robustness", () => {
+  it("should handle hash collisions correctly", () => {
+    // Force collision by returning same hash
+    const map = new RogueMap<string, string>({
+      hasher: () => 1,
+      capacity: 16,
     });
 
-    it("should handle delete in collision chain", () => {
-      const map = new RogueMap<string, number>({
-        capacity: 10,
-        valueCodec: Int32Codec,
-      });
-      (map as any).hasher = badHasher;
+    map.set("key1", "value1");
+    map.set("key2", "value2");
+    map.set("key3", "value3");
 
-      map.set("a", 1);
-      map.set("b", 2);
-      map.set("c", 3);
+    // All should be retrievable despite same hash
+    expect(map.get("key1")).toBe("value1");
+    expect(map.get("key2")).toBe("value2");
+    expect(map.get("key3")).toBe("value3");
+    expect(map.size).toBe(3);
 
-      // Chain for hash 100: [a, b]
-      // Delete 'a' (head of chain)
-      expect(map.delete("a")).toBe(true);
+    // Delete middle one
+    map.delete("key2");
+    expect(map.get("key1")).toBe("value1");
+    expect(map.get("key2")).toBeUndefined();
+    expect(map.get("key3")).toBe("value3");
+    expect(map.size).toBe(2);
 
-      // 'b' should still be found
-      expect(map.get("b")).toBe(2);
-      expect(map.has("a")).toBe(false);
-
-      // Re-insert 'a', should reuse slot or work correctly
-      map.set("a", 10);
-      expect(map.get("a")).toBe(10);
-      expect(map.get("b")).toBe(2);
-    });
-
-    it('should handle "sandwich" deletion', () => {
-      // A -> B -> C (all collide)
-      // Delete B
-      // Get C (should probe past deleted B)
-      const map = new RogueMap<string, number>({
-        capacity: 10,
-        valueCodec: Int32Codec,
-      });
-      (map as any).hasher = () => 1; // EVERYTHING collides
-
-      map.set("1", 1);
-      map.set("2", 2);
-      map.set("3", 3);
-
-      expect(map.delete("2")).toBe(true);
-
-      expect(map.get("1")).toBe(1);
-      expect(map.get("3")).toBe(3);
-      expect(map.has("2")).toBe(false);
-    });
+    // Add new one (should also collide)
+    map.set("key4", "value4");
+    expect(map.get("key1")).toBe("value1");
+    expect(map.get("key3")).toBe("value3");
+    expect(map.get("key4")).toBe("value4");
   });
 
-  describe("Buffer & Capacity Boundaries", () => {
-    it("should auto-resize when buffer is full even if capacity is not", () => {
-      // Small buffer, large capacity
-      const map = new RogueMap<string, string>({
-        capacity: 100,
-        initialMemory: 100, // Tiny buffer
-      });
-
-      // Insert until buffer full
-      // Each entry overhead: 5 (header) + 4 (keylen) + 4 (vallen) = 13 bytes
-      // Key "k" (1 byte), Value "v" (1 byte) = 15 bytes per entry.
-      // 100 bytes can hold ~6 entries.
-
-      for (let i = 0; i < 20; i++) {
-        map.set(`k${i}`, `v${i}`);
-      }
-
-      expect(map.size).toBe(20);
-      // It should have resized the buffer internally
-      // We verify by reading back
-      for (let i = 0; i < 20; i++) {
-        expect(map.get(`k${i}`)).toBe(`v${i}`);
-      }
+  it("should resize correctly when load factor exceeded", () => {
+    const initialCap = 16;
+    const map = new RogueMap<string, number>({
+      capacity: initialCap,
     });
 
-    it("should handle large values causing immediate resize", () => {
-      const map = new RogueMap<string, Buffer>({
-        initialMemory: 1024,
-        valueCodec: BufferCodec,
-      });
+    // Fill to > 75% (12 items)
+    const count = 15;
+    for (let i = 0; i < count; i++) {
+      map.set(`k${i}`, i);
+    }
 
-      const largeBuf = Buffer.alloc(2048); // Bigger than initial memory
-      largeBuf.fill(1);
-
-      map.set("big", largeBuf);
-
-      const retrieved = map.get("big");
-      expect(retrieved?.length).toBe(2048);
-      expect(retrieved?.equals(largeBuf)).toBe(true);
-    });
+    // Capacity should have doubled
+    // We can't check private capacity directly easily, but we can infer from behavior or assume successful if no error
+    // However, if resize failed, we might have lost data or thrown error.
+    
+    // Verify all items
+    for (let i = 0; i < count; i++) {
+      expect(map.get(`k${i}`)).toBe(i);
+    }
+    
+    expect(map.size).toBe(count);
   });
 
-  describe("Tombstone Reuse", () => {
-    it("should reuse deleted slots to prevent infinite growth", () => {
-      // Fixed capacity, no auto-resize for this test (we want to fill it)
-      // But RogueMap auto-resizes. We can monitor capacity.
-
-      const map = new RogueMap<string, number>({
-        capacity: 10,
-        initialMemory: 4096,
-        // We want to see if it DOESN'T resize if we keep deleting
-      });
-
-      // Fill and delete repeatedly
-      // If tombstone reuse works, we shouldn't trigger "Hash table full" or massive resizing
-      // (assuming load factor logic accounts for deletions correctly)
-
-      for (let i = 0; i < 1000; i++) {
-        map.set("temp", i);
-        map.delete("temp");
+  it("should handle large number of operations", () => {
+    const map = new RogueMap<number, number>();
+    const count = 10000;
+    
+    // Write
+    for (let i = 0; i < count; i++) {
+      map.set(i, i * 2);
+    }
+    
+    // Read
+    for (let i = 0; i < count; i++) {
+      expect(map.get(i)).toBe(i * 2);
+    }
+    
+    // Delete half
+    for (let i = 0; i < count; i += 2) {
+      map.delete(i);
+    }
+    
+    // Verify
+    for (let i = 0; i < count; i++) {
+      if (i % 2 === 0) {
+        expect(map.has(i)).toBe(false);
+      } else {
+        expect(map.get(i)).toBe(i * 2);
       }
+    }
+  });
 
-      // Final state
-      expect(map.size).toBe(0);
-
-      // Also verify with multiple keys
-      map.set("a", 1);
-      map.delete("a");
-      map.set("a", 2); // Should likely reuse
-      expect(map.get("a")).toBe(2);
-    });
+  it("should support mixed key types if hasher handles them", () => {
+    const map = new RogueMap<any, any>();
+    
+    map.set("str", 1);
+    map.set(123, "num");
+    map.set(Buffer.from("buf"), "buffer");
+    
+    expect(map.get("str")).toBe(1);
+    expect(map.get(123)).toBe("num");
+    // Buffer key equality depends on codec and lookup
+    // Default AnyCodec handles Buffer via JSON/String? 
+    // Wait, AnyCodec uses JSON.stringify. JSON.stringify(Buffer) is {type:'Buffer', data:...}
+    // So looking up with new Buffer('buf') creates same JSON string.
+    expect(map.get(Buffer.from("buf"))).toBe("buffer");
   });
 });

@@ -19,6 +19,24 @@ export const StringCodec: Codec<string> = {
 };
 
 /**
+ * UCS2 String Codec: Encodes strings as UTF-16LE (UCS-2).
+ * Space efficient for CJK, but doubles size for ASCII.
+ * Extremely fast encoding/decoding (no transcoding needed).
+ */
+export const UCS2StringCodec: Codec<string> = {
+  encode(value: string, buffer: Buffer, offset: number): number {
+    return buffer.write(value, offset, "ucs2");
+  },
+  decode(buffer: Buffer, offset: number, length: number = 0): string {
+    return buffer.toString("ucs2", offset, offset + length);
+  },
+  byteLength(value: string): number {
+    return value.length * 2;
+  },
+  fixedLength: undefined,
+};
+
+/**
  * Int32 Codec: Encodes numbers as 32-bit integers.
  * Fixed length: 4 bytes.
  */
@@ -131,7 +149,10 @@ export const BufferCodec: Codec<Buffer> = {
     return value.copy(buffer, offset);
   },
   decode(buffer: Buffer, offset: number, length: number = 0): Buffer {
-    // Return a copy to ensure safety
+    // Return a copy to ensure safety and zero-allocation source isolation
+    // Since this is BufferCodec, the user expects a Buffer instance.
+    // If we return a subarray (view), it might keep the large page buffer alive.
+    // So we allocUnsafe + copy here.
     const res = Buffer.allocUnsafe(length);
     buffer.copy(res, 0, offset, offset + length);
     return res;

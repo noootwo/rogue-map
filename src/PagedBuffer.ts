@@ -326,6 +326,27 @@ export class PagedBuffer {
     this.writeMultiByte(buf, offset);
   }
 
+  // Zero-Copy View Access
+  // Returns { buffer, offset } if fits in a single page
+  // Returns null if cross-boundary (requires allocation)
+  tryGetView(
+    offset: number,
+    length: number,
+  ): { buffer: Buffer; offset: number } | null {
+    if (this.singlePage) {
+      return { buffer: this.singlePage, offset };
+    }
+
+    const pageIdx = Math.floor(offset / PagedBuffer.PAGE_SIZE);
+    const pageOffset = offset % PagedBuffer.PAGE_SIZE;
+
+    if (pageOffset + length <= PagedBuffer.PAGE_SIZE) {
+      return { buffer: this.pages[pageIdx], offset: pageOffset };
+    }
+
+    return null;
+  }
+
   // For reading buffers (decoding)
   readBuffer(offset: number, length: number): Buffer {
     if (this.singlePage) {
