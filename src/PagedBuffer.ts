@@ -1,3 +1,5 @@
+import { Buffer } from "./internal/buffer";
+
 /**
  * PagedBuffer: A wrapper around multiple Node.js Buffers to support sizes > 2GB/4GB.
  *

@@ -1,4 +1,5 @@
 import { Codec } from "./interfaces";
+import { Buffer } from "./internal/buffer";
 
 /**
  * String Codec: Encodes strings as UTF-8.

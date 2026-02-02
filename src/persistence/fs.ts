@@ -1,5 +1,6 @@
 import { PersistenceAdapter } from "./interfaces";
 import * as fs from "fs";
+import { Buffer } from "../internal/buffer";
 import * as path from "path";
 
 /**

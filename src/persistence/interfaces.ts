@@ -3,7 +3,7 @@ export interface PersistenceAdapter {
    * Save data to storage.
    */
   save(data: Buffer, key: string): Promise<void>;
-  
+
   /**
    * Save data synchronously (if supported).
    */
@@ -20,19 +20,24 @@ export interface PersistenceAdapter {
   loadSync(key: string): Buffer | null;
 }
 
-export type PersistenceType = 'fs' | 'indexeddb' | 'localstorage' | 'memory' | 'auto';
+export type PersistenceType =
+  | "fs"
+  | "indexeddb"
+  | "localstorage"
+  | "memory"
+  | "auto";
 
 export interface PersistenceOptions {
   /**
    * Persistence type. Default 'auto'.
    */
   type?: PersistenceType;
-  
+
   /**
    * File path (Node) or Storage Key (Browser).
    */
   path: string;
-  
+
   /**
    * Auto save interval in ms. If 0, auto save is disabled.
    * Default: 0
@@ -53,13 +58,13 @@ export interface CompactionOptions {
    * Default: true
    */
   autoCompact?: boolean;
-  
+
   /**
    * Compaction threshold (ratio of deleted items).
    * Range: 0.0 - 1.0. Default: 0.3 (30%)
    */
   threshold?: number;
-  
+
   /**
    * Minimum size (number of items) to trigger compaction.
    * Default: 1000

@@ -1,6 +1,6 @@
 {
   "name": "rogue-map",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "description": "A high-performance, off-heap hash map for Node.js with 99% less memory usage than native Map.",
   "main": "./dist/index.cjs",
@@ -22,7 +22,10 @@
     "test:coverage": "vitest run --coverage",
     "build": "tsdown",
     "prepublishOnly": "npm run build",
-    "bench": "node --expose-gc --import tsx benchmarks/benchmark_suite.ts"
+    "bench": "npm run bench:perf",
+    "bench:perf": "node --expose-gc --import tsx benchmarks/benchmark_perf.ts",
+    "bench:apis": "node --expose-gc --import tsx benchmarks/benchmark_apis.ts",
+    "bench:browser": "npx vite benchmarks/browser"
   },
   "keywords": [
     "map",
@@ -43,6 +46,9 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3"
   },
   "devDependencies": {
     "@types/node": "^25.1.0",

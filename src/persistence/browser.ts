@@ -1,4 +1,5 @@
 import { PersistenceAdapter } from "./interfaces";
+import { Buffer } from "../internal/buffer";
 
 /**
  * IndexedDBAdapter: Persistence adapter for Browser IndexedDB.
@@ -15,7 +16,11 @@ export class IndexedDBAdapter implements PersistenceAdapter {
       request.onsuccess = () => resolve(request.result);
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
-        db.createObjectStore(this.storeName);
+        // Check if store exists to avoid error on version upgrade (though we use v1)
+        if (!db.objectStoreNames.contains(this.storeName)) {
+          // Create object store WITHOUT keyPath, so we must provide key in put/get
+          db.createObjectStore(this.storeName);
+        }
       };
     });
   }
